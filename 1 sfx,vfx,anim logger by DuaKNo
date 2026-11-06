@@ -1,0 +1,1457 @@
+-- Animation + VFX Logger (client-side LocalScript)
+-- Logs every animation track that plays and every VFX instance that appears/turns on.
+--
+-- Animation entry buttons:
+--   Copy    copy the AnimationId            Excl    hide it from the log (Filters tab to undo)
+--   Run     play it on your own character   Block   auto-stop it whenever it plays
+--   Stop    stop it where it's playing now  Detail  copy a script that REBUILDS the anim joint-by-joint
+--   Code    copy a script that plays this exact AnimationId in any other game
+--   RBXMX   save the animation as a .rbxmx KeyframeSequence file
+--           (load it with: game:GetObjects(getcustomasset("file.rbxmx"))[1])
+--
+-- VFX entry buttons: Copy / Run / Excl
+-- "Detailed: ON" auto-captures every new animation so the moved parts show up in the log.
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Debris = game:GetService("Debris")
+local lp = Players.LocalPlayer
+
+--// Settings
+local MAX_ENTRIES = 150
+local POLL_RATE = 0.1 -- seconds between animation checks (every frame while something is blocked)
+local CAPTURE_STEP = 1 / 30 -- Detailed capture sample interval
+
+--// State
+local paused = false
+local ownOnly = false
+local uniqueOnly = false
+local detailedMode = false
+local currentTab = "Anim"
+local seenKeys = { Anim = {}, VFX = {} }
+local queues = { Anim = {}, VFX = {} }
+local counter = 0
+local exportLog = { Anim = {}, VFX = {} } -- full history for Download / Copy All
+local ownTracks = setmetatable({}, { __mode = "k" }) -- tracks we played ourselves (don't log/block)
+local MAX_EXPORT = 2000
+
+local excluded = {} -- [animId] = true  (hidden from log)
+local excludedVFX = {} -- [vfxKey] = true (hidden from log)
+local blocked = {} -- [animId] = true   (auto-stopped)
+local blockedLogged = {} -- [animId] = true (logged once while blocked)
+local animInfo = {} -- [animId] = { priority, looped, speed }
+local animLabel = {} -- [animId] = "TrackName / Owner"
+local vfxLabel = {} -- [vfxKey] = "Class: Name"
+local details = {} -- [animId] = { code, summary, rbxmx }
+local rbxmxCache = {} -- [animId] = { xml, source }
+local detailJobs = {} -- [animId] = { callbacks }
+local detailQueue, detailWorking = {}, false
+local entriesById = {} -- [animId] = { ent, ... }
+local updaters = {} -- button-state refreshers
+
+local VFX_CLASSES = {
+	ParticleEmitter = true, Beam = true, Trail = true, Fire = true,
+	Smoke = true, Sparkles = true, Explosion = true, Highlight = true,
+	PointLight = true, SpotLight = true, SurfaceLight = true,
+}
+
+local setclip = setclipboard or toclipboard
+
+--// Helpers
+local function esc(s)
+	return (tostring(s):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
+end
+
+local function shortPath(inst)
+	local parts, cur = {}, inst
+	while cur and cur ~= workspace and cur ~= game do
+		table.insert(parts, 1, cur.Name)
+		cur = cur.Parent
+	end
+	if #parts > 3 then parts = { "..", parts[#parts - 2], parts[#parts - 1], parts[#parts] } end
+	return table.concat(parts, ".")
+end
+
+local function isOwn(inst)
+	local char = lp.Character
+	return char ~= nil and inst:IsDescendantOf(char)
+end
+
+local function fmtColor(c)
+	return string.format("%d,%d,%d", c.R * 255, c.G * 255, c.B * 255)
+end
+
+local function countKeys(t)
+	local n = 0
+	for _ in pairs(t) do n += 1 end
+	return n
+end
+
+--// Re-run helpers (play an animation / spawn a VFX on your own character)
+local function getRoot()
+	local char = lp.Character
+	return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+local function playAnim(id)
+	local char = lp.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not hum then error("no humanoid") end
+	local animator = hum:FindFirstChildOfClass("Animator") or Instance.new("Animator", hum)
+	local a = Instance.new("Animation")
+	a.AnimationId = id
+	local track = animator:LoadAnimation(a)
+	ownTracks[track] = true
+	track:Play()
+end
+
+local function playVFX(inst)
+	local root = getRoot()
+	if not root then error("no root") end
+	local clone = inst:Clone()
+	if not clone then error("clone failed") end
+	clone:SetAttribute("_LoggerClone", true)
+	for _, d in ipairs(clone:GetDescendants()) do d:SetAttribute("_LoggerClone", true) end
+
+	local cls = clone.ClassName
+	local life = 5
+	if cls == "ParticleEmitter" then
+		clone.Enabled = false
+		clone.Parent = root
+		clone:Emit(math.max(clone.Rate, 20))
+		life = clone.Lifetime.Max + 1
+	elseif cls == "Beam" then
+		local a0 = Instance.new("Attachment", root)
+		local a1 = Instance.new("Attachment", root)
+		a1.Position = Vector3.new(0, 0, -10)
+		a0:SetAttribute("_LoggerClone", true)
+		a1:SetAttribute("_LoggerClone", true)
+		clone.Attachment0, clone.Attachment1 = a0, a1
+		clone.Enabled = true
+		clone.Parent = root
+		Debris:AddItem(a0, life)
+		Debris:AddItem(a1, life)
+	elseif cls == "Trail" then
+		local a0 = Instance.new("Attachment", root)
+		local a1 = Instance.new("Attachment", root)
+		a0.Position, a1.Position = Vector3.new(0, 1, 0), Vector3.new(0, -1, 0)
+		a0:SetAttribute("_LoggerClone", true)
+		a1:SetAttribute("_LoggerClone", true)
+		clone.Attachment0, clone.Attachment1 = a0, a1
+		clone.Enabled = true
+		clone.Parent = root
+		life = 8 -- move around to see it
+		Debris:AddItem(a0, life)
+		Debris:AddItem(a1, life)
+	elseif cls == "Explosion" then
+		clone.BlastPressure = 0
+		clone.Position = root.Position
+		clone.Parent = workspace
+	elseif cls == "Highlight" then
+		clone.Adornee = lp.Character
+		clone.Parent = lp.Character
+	else
+		clone.Enabled = true
+		clone.Parent = root
+	end
+	Debris:AddItem(clone, life)
+end
+
+--// Code generation -------------------------------------------------------
+
+local function num(n)
+	local s = string.format("%.4f", n):gsub("0+$", ""):gsub("%.$", "")
+	if s == "-0" or s == "" then s = "0" end
+	return s
+end
+
+local function cfStr(cf)
+	local c = { cf:GetComponents() }
+	for i, v in ipairs(c) do c[i] = num(v) end
+	return "CFrame.new(" .. table.concat(c, ",") .. ")"
+end
+
+local function cfDiffers(a, b)
+	return (a.Position - b.Position).Magnitude > 0.002
+		or (a.XVector - b.XVector).Magnitude > 0.002
+		or (a.YVector - b.YVector).Magnitude > 0.002
+end
+
+-- Simple code: plays the original animation by id in any game
+local function simpleCode(id)
+	local info = animInfo[id] or {}
+	return string.format([==[-- Play animation %s on your character
+-- (the animation must be usable by that game/account - otherwise use the Detail script)
+local Players = game:GetService("Players")
+local char = Players.LocalPlayer.Character or Players.LocalPlayer.CharacterAdded:Wait()
+local hum = char:WaitForChild("Humanoid")
+local animator = hum:FindFirstChildOfClass("Animator") or Instance.new("Animator", hum)
+
+local anim = Instance.new("Animation")
+anim.AnimationId = "%s"
+local track = animator:LoadAnimation(anim)
+track.Priority = Enum.AnimationPriority.%s
+track.Looped = %s
+track:Play(0.1, 1, %s)
+]==], id, id, info.priority or "Action", tostring(info.looped or false), num(info.speed or 1))
+end
+
+-- Playback part of the Detail script. Works like RobAnimator: the Animator is removed so
+-- nothing else rewrites the joints, then every Motor6D.Transform is set on Heartbeat.
+local PLAYBACK_CODE = [==[
+-- stop a previous run of this script (if any)
+if _G.StopRecreatedAnim then pcall(_G.StopRecreatedAnim) end
+
+local char = lp.Character or lp.CharacterAdded:Wait()
+local hum = char:WaitForChild("Humanoid")
+
+local function notify(text)
+	print("[RecreatedAnim] " .. text)
+	pcall(function()
+		game:GetService("StarterGui"):SetCore("SendNotification", {
+			Title = "Recreated anim", Text = text, Duration = 4,
+		})
+	end)
+end
+
+if hum.RigType.Name ~= RIG then
+	notify("Captured on " .. RIG .. " but your character is " .. hum.RigType.Name .. " - can't play here.")
+	return
+end
+
+local motors, count = {}, 0
+for _, d in ipairs(char:GetDescendants()) do
+	if d:IsA("Motor6D") and JOINTS[d.Name] and d.Part1 and not motors[d.Name] then
+		motors[d.Name] = d
+		count += 1
+	end
+end
+if count == 0 then
+	notify("No matching joints found on your character.")
+	return
+end
+
+local function apply(pose)
+	for name, cf in pairs(pose) do
+		local m = motors[name]
+		if m then m.Transform = cf end
+	end
+end
+
+-- remove the Animator + disable Animate so nothing overwrites the pose
+local animate = char:FindFirstChild("Animate")
+local animateWasDisabled = animate and animate.Disabled
+local removedAnimator = false
+
+local function removeAnimator()
+	local a = hum:FindFirstChildOfClass("Animator")
+	if a then
+		a:Destroy()
+		removedAnimator = true
+	end
+end
+
+if DISABLE_DEFAULT_ANIMATE then
+	if animate then animate.Disabled = true end
+	removeAnimator()
+end
+
+local accumulated = 0
+local index = 1
+local lastFrame
+local conn
+
+local function stop()
+	if conn then conn:Disconnect() conn = nil end
+	for _, m in pairs(motors) do m.Transform = CFrame.new() end
+	if removedAnimator and not hum:FindFirstChildOfClass("Animator") then
+		Instance.new("Animator").Parent = hum -- give the character its Animator back
+	end
+	if animate and DISABLE_DEFAULT_ANIMATE then animate.Disabled = animateWasDisabled end
+	_G.StopRecreatedAnim = nil
+end
+
+conn = RunService.Heartbeat:Connect(function(dt)
+	accumulated += dt * SPEED
+	if DISABLE_DEFAULT_ANIMATE then removeAnimator() end
+
+	-- advance through the captured frames
+	while frames[index] and accumulated >= frames[index].dt do
+		accumulated -= frames[index].dt
+		lastFrame = frames[index]
+		index += 1
+	end
+
+	local nextFrame = frames[index]
+	if not nextFrame then
+		-- reached the end
+		if lastFrame then apply(lastFrame.j) end
+		if LOOPED or LOOP_FOREVER then
+			index, accumulated = 1, 0
+		else
+			stop()
+		end
+		return
+	end
+
+	if lastFrame and SMOOTH then
+		-- blend from the last frame toward the next one
+		local alpha = math.clamp(accumulated / math.max(nextFrame.dt, 1e-6), 0, 1)
+		for name, cf in pairs(nextFrame.j) do
+			local m = motors[name]
+			local from = lastFrame.j[name]
+			if m and from then m.Transform = from:Lerp(cf, alpha) end
+		end
+	elseif lastFrame then
+		apply(lastFrame.j)
+	end
+end)
+
+-- call _G.StopRecreatedAnim() to stop early (only you can see this - it's client-side)
+_G.StopRecreatedAnim = stop
+notify(string.format("Playing (%d joints, %.2fs)", count, LENGTH))
+]==]
+
+-- joints = { { name, part0, part1, frames = { {t, cf}, ... } }, ... }
+local function genDetailedCode(id, rig, length, looped, joints)
+	local L = {}
+	local function add(s) table.insert(L, s) end
+
+	local names = {}
+	for _, j in ipairs(joints) do table.insert(names, j.part1 .. " [" .. j.name .. "]") end
+
+	add("-- Recreated animation - runs WITHOUT the original animation")
+	add("-- Source AnimationId: " .. id)
+	add(string.format("-- Rig: %s | Length: %.2fs | Looped: %s", rig, length, tostring(looped)))
+	add("-- Parts moved: " .. table.concat(names, ", "))
+	add("-- Every frame lists where each joint goes - e.g. the 'Left Shoulder' joint is")
+	add("-- what moves the Left Arm (rot = degrees XYZ, just for reading).")
+	add("")
+	add('local Players = game:GetService("Players")')
+	add('local RunService = game:GetService("RunService")')
+	add("local lp = Players.LocalPlayer")
+	add("")
+	add("local LENGTH = " .. num(length))
+	add("local LOOPED = " .. tostring(looped))
+	add("local SPEED = 1")
+	add(string.format("local RIG = %q -- rig type this was captured on (must match yours)", rig))
+	add("local SMOOTH = true -- blend between captured frames (false = exact frame steps)")
+	add("local LOOP_FOREVER = false -- set true to repeat until you call _G.StopRecreatedAnim()")
+	add("local DISABLE_DEFAULT_ANIMATE = true -- removes the Animator while playing, restored after")
+	add("")
+	add("local JOINTS = { -- the Motor6D joints this animation moves")
+	for _, j in ipairs(joints) do
+		add(string.format("\t[%q] = true, -- %s  (%s -> %s)", j.name, j.part1, j.part0, j.part1))
+	end
+	add("}")
+	add("")
+	add("-- one entry per captured frame: dt = seconds since the previous frame,")
+	add("-- j = where every joint goes")
+	add("local frames = {")
+	local base = joints[1].frames
+	for i = 1, #base do
+		local dt = i > 1 and (base[i][1] - base[i - 1][1]) or 0
+		add(string.format("\t{ dt = %s, j = {", num(dt)))
+		for _, j in ipairs(joints) do
+			local cf = j.frames[i][2]
+			local rx, ry, rz = cf:ToEulerAnglesXYZ()
+			add(string.format(
+				"\t\t[%q] = %s, -- %s rot %d, %d, %d",
+				j.name, cfStr(cf), j.part1,
+				math.floor(math.deg(rx) + 0.5), math.floor(math.deg(ry) + 0.5), math.floor(math.deg(rz) + 0.5)
+			))
+		end
+		add("\t} },")
+	end
+	add("}")
+	add("")
+	add(PLAYBACK_CODE)
+	return table.concat(L, "\n")
+end
+
+--// RBXMX (KeyframeSequence) export ---------------------------------------
+local function g(n) return string.format("%.6g", n) end
+
+local function xmlEsc(s)
+	return (tostring(s):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"):gsub('"', "&quot;"))
+end
+
+local CF_TAGS = { "X", "Y", "Z", "R00", "R01", "R02", "R10", "R11", "R12", "R20", "R21", "R22" }
+local function cfXml(cf)
+	local c = { cf:GetComponents() }
+	local parts = { '<CoordinateFrame name="CFrame">' }
+	for i, tag in ipairs(CF_TAGS) do
+		parts[#parts + 1] = "<" .. tag .. ">" .. g(c[i]) .. "</" .. tag .. ">"
+	end
+	parts[#parts + 1] = "</CoordinateFrame>"
+	return table.concat(parts)
+end
+
+local RBXMX_HEAD = '<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" '
+	.. 'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+	.. 'xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">'
+
+local function buildRbxmx(name, loop, priority, emitKeyframes)
+	local lines, refN = {}, -1
+	local function w(s) lines[#lines + 1] = s end
+	local function ref() refN += 1 return refN end
+
+	w(RBXMX_HEAD)
+	w('<Meta name="ExplicitAutoJoints">true</Meta>')
+	w(string.format('<Item class="KeyframeSequence" referent="RBX%d"><Properties>', ref()))
+	w(string.format(
+		'<bool name="Loop">%s</bool><string name="Name">%s</string><token name="Priority">%d</token>',
+		tostring(loop), xmlEsc(name), priority
+	))
+	w("</Properties>")
+	emitKeyframes(w, ref)
+	w("</Item>")
+	w("</roblox>")
+	return table.concat(lines, "\n")
+end
+
+local function keyframeOpen(ref, t)
+	return string.format(
+		'<Item class="Keyframe" referent="RBX%d"><Properties><string name="Name">Keyframe</string><float name="Time">%s</float></Properties>',
+		ref(), g(t)
+	)
+end
+
+-- from the original KeyframeSequence instance (exact: keeps easing styles)
+local function emitPoseInst(w, ref, pose)
+	w(string.format('<Item class="Pose" referent="RBX%d"><Properties>', ref()))
+	w(cfXml(pose.CFrame))
+	w(string.format(
+		'<token name="EasingDirection">%d</token><token name="EasingStyle">%d</token>',
+		pose.EasingDirection.Value, pose.EasingStyle.Value
+	))
+	w(string.format('<string name="Name">%s</string><float name="Weight">%s</float>', xmlEsc(pose.Name), g(pose.Weight)))
+	w("</Properties>")
+	for _, c in ipairs(pose:GetChildren()) do
+		if c:IsA("Pose") then emitPoseInst(w, ref, c) end
+	end
+	w("</Item>")
+end
+
+local function rbxmxFromInstance(ks)
+	local kfs = {}
+	for _, c in ipairs(ks:GetChildren()) do
+		if c:IsA("Keyframe") then table.insert(kfs, c) end
+	end
+	table.sort(kfs, function(a, b) return a.Time < b.Time end)
+	if #kfs == 0 then error("empty KeyframeSequence") end
+	return buildRbxmx(ks.Name, ks.Loop, ks.Priority.Value, function(w, ref)
+		for _, kf in ipairs(kfs) do
+			w(keyframeOpen(ref, kf.Time))
+			for _, p in ipairs(kf:GetChildren()) do
+				if p:IsA("Pose") then emitPoseInst(w, ref, p) end
+			end
+			w("</Item>")
+		end
+	end)
+end
+
+-- from captured samples (the pose tree follows the rig: HumanoidRootPart -> Torso -> arms ...)
+local function emitCapturedPose(w, ref, name, cf, weight, kids, i)
+	w(string.format('<Item class="Pose" referent="RBX%d"><Properties>', ref()))
+	w(cfXml(cf))
+	w('<token name="EasingDirection">0</token><token name="EasingStyle">0</token>')
+	w(string.format('<string name="Name">%s</string><float name="Weight">%d</float>', xmlEsc(name), weight))
+	w("</Properties>")
+	for _, k in ipairs(kids[name] or {}) do
+		emitCapturedPose(w, ref, k.name, k.samples[i][2], 1, kids, i)
+	end
+	w("</Item>")
+end
+
+local function rbxmxFromCapture(name, loop, priority, motorsInfo)
+	local kids, isChild, roots, seenRoot = {}, {}, {}, {}
+	for _, mi in ipairs(motorsInfo) do
+		kids[mi.parent] = kids[mi.parent] or {}
+		table.insert(kids[mi.parent], mi)
+		isChild[mi.name] = true
+	end
+	for _, mi in ipairs(motorsInfo) do
+		if not isChild[mi.parent] and not seenRoot[mi.parent] then
+			seenRoot[mi.parent] = true
+			table.insert(roots, mi.parent)
+		end
+	end
+	local n = math.huge
+	for _, mi in ipairs(motorsInfo) do n = math.min(n, #mi.samples) end
+
+	return buildRbxmx(name, loop, priority, function(w, ref)
+		for i = 1, n do
+			w(keyframeOpen(ref, motorsInfo[1].samples[i][1]))
+			for _, rootName in ipairs(roots) do
+				emitCapturedPose(w, ref, rootName, CFrame.new(), 0, kids, i)
+			end
+			w("</Item>")
+		end
+	end)
+end
+
+-- try to get the real KeyframeSequence of an animation asset
+local function fetchOriginalSequence(id)
+	local ok, objs = pcall(function() return game:GetObjects(id) end)
+	if ok and typeof(objs) == "table" then
+		for _, o in ipairs(objs) do
+			if o:IsA("KeyframeSequence") then return o end
+			local inner = o:FindFirstChildWhichIsA("KeyframeSequence", true)
+			if inner then return inner end
+		end
+	end
+	local ok2, ks = pcall(function()
+		return game:GetService("KeyframeSequenceProvider"):GetKeyframeSequenceAsync(id)
+	end)
+	if ok2 and ks then return ks end
+	return nil
+end
+
+--// Detail capture --------------------------------------------------------
+-- Plays the animation on a hidden clone of your character (so nothing else interferes),
+-- samples every Motor6D.Transform over time, builds the rebuild-script and an rbxmx.
+local function captureDetail(id)
+	local char = lp.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not (char and hum and getRoot()) then error("character not ready") end
+
+	local oldArch = char.Archivable
+	char.Archivable = true
+	local dummy = char:Clone()
+	char.Archivable = oldArch
+	if not dummy then error("couldn't clone your character") end
+
+	dummy.Name = "_AnimCaptureDummy"
+	dummy:SetAttribute("_LoggerClone", true)
+	for _, d in ipairs(dummy:GetDescendants()) do
+		d:SetAttribute("_LoggerClone", true)
+		if d:IsA("LuaSourceContainer") then
+			d:Destroy()
+		elseif d:IsA("BasePart") then
+			d.Anchored = true
+		end
+	end
+	dummy:PivotTo(CFrame.new(0, 20000, 0))
+
+	local dHum = dummy:FindFirstChildOfClass("Humanoid")
+	if not dHum then dummy:Destroy() error("clone has no humanoid") end
+	pcall(function() dHum.EvaluateStateMachine = false end)
+	local animator = dHum:FindFirstChildOfClass("Animator")
+	if not animator then
+		animator = Instance.new("Animator")
+		animator:SetAttribute("_LoggerClone", true)
+		animator.Parent = dHum
+	end
+	dummy.Parent = workspace
+
+	local motors = {}
+	for _, d in ipairs(dummy:GetDescendants()) do
+		if d:IsA("Motor6D") and d.Part0 and d.Part1 then table.insert(motors, d) end
+	end
+
+	local anim = Instance.new("Animation")
+	anim.AnimationId = id
+	local okLoad, track = pcall(function() return animator:LoadAnimation(anim) end)
+	if not okLoad or not track then
+		dummy:Destroy()
+		error("couldn't load animation (not allowed / invalid id)")
+	end
+	ownTracks[track] = true
+
+	local looped, priority, speed = track.Looped, track.Priority.Name, track.Speed
+	local priorityValue = track.Priority.Value
+	animInfo[id] = animInfo[id] or { priority = priority, looped = looped, speed = speed }
+	track.Looped = false
+
+	local waited = 0
+	while track.Length == 0 and waited < 5 do waited += RunService.Heartbeat:Wait() end
+	if track.Length == 0 then
+		dummy:Destroy()
+		error("animation failed to load (not allowed / invalid id)")
+	end
+	local maxTime = track.Length + 3
+
+	local samples = {}
+	for _, m in ipairs(motors) do samples[m] = {} end
+
+	track:Play(0, 1, 1)
+	local startClock, nextT, firstPos = os.clock(), 0, nil
+	while track.IsPlaying and os.clock() - startClock < maxTime do
+		RunService.Heartbeat:Wait()
+		local pos = track.TimePosition
+		if pos > 0 and pos >= nextT then
+			firstPos = firstPos or pos
+			for _, m in ipairs(motors) do
+				table.insert(samples[m], { pos - firstPos, m.Transform })
+			end
+			nextT = pos + CAPTURE_STEP
+		end
+	end
+	track:Stop(0)
+	dummy:Destroy()
+
+	-- keep only joints that actually moved (for the Lua script)
+	local identity = CFrame.new()
+	local joints, totalFrames, totalLength = {}, 0, 0
+	local allMotors = {}
+	for _, m in ipairs(motors) do
+		local s = samples[m]
+		if #s >= 2 then
+			table.insert(allMotors, { name = m.Part1.Name, parent = m.Part0.Name, samples = s })
+		end
+		local moved = false
+		for _, f in ipairs(s) do
+			if cfDiffers(f[2], identity) then moved = true break end
+		end
+		if moved and #s >= 2 then
+			-- keep every frame so all joints stay in sync
+			totalFrames = math.max(totalFrames, #s)
+			totalLength = math.max(totalLength, s[#s][1])
+			table.insert(joints, { name = m.Name, part0 = m.Part0.Name, part1 = m.Part1.Name, frames = s })
+		end
+	end
+
+	if #joints == 0 then
+		error("no joints moved - rig mismatch? (your rig is " .. hum.RigType.Name .. ")")
+	end
+
+	local names = {}
+	for _, j in ipairs(joints) do table.insert(names, j.part1 .. " (" .. j.name .. ")") end
+	local summary = string.format(
+		"Moved: %s | %d frames | %.2fs | %s",
+		table.concat(names, ", "), totalFrames, totalLength, hum.RigType.Name
+	)
+
+	local seqName = "Anim_" .. (id:match("%d+") or "x")
+	return {
+		code = genDetailedCode(id, hum.RigType.Name, totalLength, looped, joints),
+		summary = summary,
+		rbxmx = rbxmxFromCapture(seqName, looped, priorityValue, allMotors),
+	}
+end
+
+--// GUI -------------------------------------------------------------------
+local COL = {
+	bg = Color3.fromRGB(22, 22, 30),
+	bar = Color3.fromRGB(40, 40, 58),
+	btn = Color3.fromRGB(50, 50, 70),
+	on = Color3.fromRGB(80, 80, 140),
+	list = Color3.fromRGB(16, 16, 22),
+	row = Color3.fromRGB(34, 34, 46),
+	blue = Color3.fromRGB(50, 90, 140),
+	green = Color3.fromRGB(50, 130, 70),
+	orange = Color3.fromRGB(170, 110, 40),
+	purple = Color3.fromRGB(110, 70, 150),
+	red = Color3.fromRGB(150, 60, 60),
+	text = Color3.fromRGB(220, 220, 230),
+}
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "AnimVFXLogger"
+gui.ResetOnSpawn = false
+gui.DisplayOrder = 999
+gui.Parent = lp:WaitForChild("PlayerGui")
+
+local main = Instance.new("Frame")
+main.Size = UDim2.new(0, 340, 0, 400)
+main.Position = UDim2.new(0.5, -170, 0.5, -200)
+main.BackgroundColor3 = COL.bg
+main.BorderSizePixel = 0
+main.Parent = gui
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 8)
+
+local titleBar = Instance.new("TextLabel")
+titleBar.Size = UDim2.new(1, 0, 0, 28)
+titleBar.BackgroundColor3 = COL.bar
+titleBar.BorderSizePixel = 0
+titleBar.Text = "  Anim / VFX Logger"
+titleBar.TextXAlignment = Enum.TextXAlignment.Left
+titleBar.TextColor3 = Color3.new(1, 1, 1)
+titleBar.Font = Enum.Font.GothamBold
+titleBar.TextSize = 14
+titleBar.Parent = main
+Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0, 8)
+
+local body = Instance.new("Frame") -- everything below the title bar (hidden when minimized)
+body.Size = UDim2.new(1, 0, 1, -28)
+body.Position = UDim2.new(0, 0, 0, 28)
+body.BackgroundTransparency = 1
+body.Parent = main
+
+local function titleButton(text, offset, color)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(0, 28, 0, 28)
+	b.Position = UDim2.new(1, offset, 0, 0)
+	b.BackgroundTransparency = 1
+	b.Text = text
+	b.TextColor3 = color
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 14
+	b.Parent = titleBar
+	return b
+end
+
+local closeBtn = titleButton("X", -28, Color3.fromRGB(255, 120, 120))
+closeBtn.MouseButton1Click:Connect(function() gui:Destroy() end)
+
+local minimized = false
+local minBtn = titleButton("-", -56, Color3.fromRGB(200, 200, 255))
+minBtn.MouseButton1Click:Connect(function()
+	minimized = not minimized
+	body.Visible = not minimized
+	main.Size = minimized and UDim2.new(0, 340, 0, 28) or UDim2.new(0, 340, 0, 400)
+	minBtn.Text = minimized and "+" or "-"
+end)
+
+-- dragging (mouse + touch)
+do
+	local dragging, dragStart, startPos
+	titleBar.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging, dragStart, startPos = true, input.Position, main.Position
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then dragging = false end
+			end)
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local d = input.Position - dragStart
+			main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+		end
+	end)
+end
+
+local function makeButton(text, x, w, y)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(0, w, 0, 24)
+	b.Position = UDim2.new(0, x, 0, y)
+	b.BackgroundColor3 = COL.btn
+	b.BorderSizePixel = 0
+	b.Text = text
+	b.TextColor3 = Color3.new(1, 1, 1)
+	b.Font = Enum.Font.GothamMedium
+	b.TextSize = 12
+	b.Parent = body
+	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
+	return b
+end
+
+-- Row 1 (y=6): tabs  |  Pause / Clear
+local animTab = makeButton("Animations", 6, 84, 6)
+local vfxTab = makeButton("VFX", 94, 50, 6)
+local filtBtn = makeButton("Filters 0/0", 148, 88, 6)
+local pauseBtn = makeButton("Pause", 240, 46, 6)
+local clearBtn = makeButton("Clear", 290, 44, 6)
+-- Row 2 (y=34): options
+local ownBtn = makeButton("Own: off", 6, 80, 34)
+local uniqBtn = makeButton("Unique: off", 90, 100, 34)
+local detailBtn = makeButton("Detailed: off", 194, 140, 34)
+-- Row 3 (y=62): actions
+local stopMineBtn = makeButton("Stop Mine", 6, 108, 62)
+local dlBtn = makeButton("Download log", 118, 108, 62)
+local copyAllBtn = makeButton("Copy All", 230, 104, 62)
+filtBtn.TextSize = 11
+
+-- lists
+local lists = {}
+for _, name in ipairs({ "Anim", "VFX", "Filters" }) do
+	local sf = Instance.new("ScrollingFrame")
+	sf.Size = UDim2.new(1, -12, 1, -164)
+	sf.Position = UDim2.new(0, 6, 0, 92)
+	sf.BackgroundColor3 = COL.list
+	sf.BorderSizePixel = 0
+	sf.ScrollBarThickness = 4
+	sf.CanvasSize = UDim2.new()
+	sf.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	sf.Visible = (name == currentTab)
+	sf.Parent = body
+	local layout = Instance.new("UIListLayout", sf)
+	layout.Padding = UDim.new(0, 3)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	lists[name] = sf
+end
+
+local copyBox = Instance.new("TextBox")
+copyBox.Size = UDim2.new(1, -12, 0, 60)
+copyBox.Position = UDim2.new(0, 6, 1, -66)
+copyBox.BackgroundColor3 = Color3.fromRGB(30, 30, 42)
+copyBox.BorderSizePixel = 0
+copyBox.Text = "Use the buttons on an entry. Output shows here..."
+copyBox.TextColor3 = Color3.fromRGB(200, 255, 200)
+copyBox.Font = Enum.Font.Code
+copyBox.TextSize = 12
+copyBox.TextWrapped = true
+copyBox.TextXAlignment = Enum.TextXAlignment.Left
+copyBox.TextYAlignment = Enum.TextYAlignment.Top
+copyBox.ClearTextOnFocus = false
+copyBox.MultiLine = true
+copyBox.Parent = body
+
+local function toClip(text)
+	local copied = false
+	if setclip then copied = pcall(setclip, text) end
+	if copied and #text > 3000 then
+		copyBox.Text = text:sub(1, 3000) .. "\n--[[ ...copied to clipboard (" .. #text .. " chars) ]]"
+	else
+		copyBox.Text = #text > 150000 and text:sub(1, 150000) or text
+	end
+	return copied
+end
+
+local lastLogTab = "Anim"
+local function setTab(name)
+	currentTab = name
+	if name ~= "Filters" then lastLogTab = name end
+	for n, sf in pairs(lists) do sf.Visible = (n == name) end
+	animTab.BackgroundColor3 = name == "Anim" and COL.on or COL.btn
+	vfxTab.BackgroundColor3 = name == "VFX" and COL.on or COL.btn
+	filtBtn.BackgroundColor3 = name == "Filters" and COL.on or COL.btn
+end
+setTab("Anim")
+
+animTab.MouseButton1Click:Connect(function() setTab("Anim") end)
+vfxTab.MouseButton1Click:Connect(function() setTab("VFX") end)
+
+pauseBtn.MouseButton1Click:Connect(function()
+	paused = not paused
+	pauseBtn.Text = paused and "Resume" or "Pause"
+end)
+clearBtn.MouseButton1Click:Connect(function()
+	for kind, q in pairs(queues) do
+		for _, b in ipairs(q) do b:Destroy() end
+		table.clear(q)
+		table.clear(seenKeys[kind])
+		table.clear(exportLog[kind])
+	end
+	table.clear(entriesById)
+end)
+ownBtn.MouseButton1Click:Connect(function()
+	ownOnly = not ownOnly
+	ownBtn.Text = ownOnly and "Own: on" or "Own: off"
+end)
+uniqBtn.MouseButton1Click:Connect(function()
+	uniqueOnly = not uniqueOnly
+	uniqBtn.Text = uniqueOnly and "Unique: on" or "Unique: off"
+end)
+
+local refreshAll -- forward declaration
+
+-- Filters tab: everything you excluded / blocked (animations AND VFX), with an undo button each
+local function rebuildFilters()
+	local sf = lists.Filters
+	for _, c in ipairs(sf:GetChildren()) do
+		if c:IsA("GuiObject") then c:Destroy() end
+	end
+
+	local order = 0
+	local function addRow(kindText, title, subtitle, btnText, onClick)
+		order += 1
+		local row = Instance.new("Frame")
+		row.Size = UDim2.new(1, -6, 0, 40)
+		row.BackgroundColor3 = COL.row
+		row.BorderSizePixel = 0
+		row.LayoutOrder = order
+		row.Parent = sf
+
+		local lbl = Instance.new("TextLabel")
+		lbl.Size = UDim2.new(1, -74, 1, 0)
+		lbl.BackgroundTransparency = 1
+		lbl.RichText = true
+		lbl.TextWrapped = true
+		lbl.TextXAlignment = Enum.TextXAlignment.Left
+		lbl.TextYAlignment = Enum.TextYAlignment.Top
+		lbl.Font = Enum.Font.Code
+		lbl.TextSize = 11
+		lbl.TextColor3 = COL.text
+		lbl.Text = string.format("<b>%s</b> %s\n%s", kindText, esc(title), esc(subtitle))
+		Instance.new("UIPadding", lbl).PaddingLeft = UDim.new(0, 4)
+		lbl.Parent = row
+
+		local b = Instance.new("TextButton")
+		b.Size = UDim2.new(0, 66, 0, 26)
+		b.Position = UDim2.new(1, -70, 0, 7)
+		b.BackgroundColor3 = COL.purple
+		b.BorderSizePixel = 0
+		b.Text = btnText
+		b.TextColor3 = Color3.new(1, 1, 1)
+		b.Font = Enum.Font.GothamMedium
+		b.TextSize = 12
+		b.Parent = row
+		Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
+		b.MouseButton1Click:Connect(onClick)
+	end
+
+	local total = countKeys(excluded) + countKeys(excludedVFX) + countKeys(blocked)
+	if total > 0 then
+		order += 1
+		local resetAll = Instance.new("TextButton")
+		resetAll.Size = UDim2.new(1, -6, 0, 26)
+		resetAll.BackgroundColor3 = COL.red
+		resetAll.BorderSizePixel = 0
+		resetAll.LayoutOrder = order
+		resetAll.Text = "Reset all (unexclude + unblock everything)"
+		resetAll.TextColor3 = Color3.new(1, 1, 1)
+		resetAll.Font = Enum.Font.GothamMedium
+		resetAll.TextSize = 12
+		resetAll.Parent = sf
+		Instance.new("UICorner", resetAll).CornerRadius = UDim.new(0, 5)
+		resetAll.MouseButton1Click:Connect(function()
+			table.clear(excluded)
+			table.clear(excludedVFX)
+			table.clear(blocked)
+			table.clear(blockedLogged)
+			refreshAll()
+		end)
+	end
+
+	for id in pairs(excluded) do
+		addRow("Excluded anim", animLabel[id] or "", id, "Unexcl", function()
+			excluded[id] = nil
+			refreshAll()
+		end)
+	end
+	for key in pairs(excludedVFX) do
+		addRow("Excluded VFX", vfxLabel[key] or key, key, "Unexcl", function()
+			excludedVFX[key] = nil
+			refreshAll()
+		end)
+	end
+	for id in pairs(blocked) do
+		addRow("Blocked anim", animLabel[id] or "", id, "Unblock", function()
+			blocked[id] = nil
+			blockedLogged[id] = nil
+			refreshAll()
+		end)
+	end
+
+	if total == 0 then
+		local empty = Instance.new("TextLabel")
+		empty.Size = UDim2.new(1, -6, 0, 40)
+		empty.BackgroundTransparency = 1
+		empty.Text = "Nothing excluded or blocked."
+		empty.TextColor3 = Color3.fromRGB(160, 160, 175)
+		empty.Font = Enum.Font.Gotham
+		empty.TextSize = 12
+		empty.Parent = sf
+	end
+end
+
+refreshAll = function()
+	for i = #updaters, 1, -1 do
+		if not updaters[i]() then table.remove(updaters, i) end
+	end
+	filtBtn.Text = string.format("Filters %d/%d", countKeys(excluded) + countKeys(excludedVFX), countKeys(blocked))
+	rebuildFilters()
+end
+
+filtBtn.MouseButton1Click:Connect(function()
+	if currentTab == "Filters" then
+		setTab(lastLogTab)
+	else
+		rebuildFilters()
+		setTab("Filters")
+	end
+end)
+
+--// Entry creation --------------------------------------------------------
+local function flash(btn, text)
+	local old = btn.Text
+	btn.Text = text
+	task.delay(1, function()
+		if btn.Parent then btn.Text = old end
+	end)
+end
+
+-- actions = { { text=, color=, fn=function(btn) end, state=function() return text, on end }, ... }
+-- buttons are laid out 4 per row
+local function addEntry(kind, key, title, detail, copyText, actions)
+	if paused then return end
+	if uniqueOnly then
+		if seenKeys[kind][key] then return end
+		seenKeys[kind][key] = true
+	end
+
+	counter += 1
+
+	local log = exportLog[kind]
+	table.insert(log, { title = title, detail = detail, copy = copyText })
+	if #log > MAX_EXPORT then table.remove(log, 1) end
+
+	local row = Instance.new("Frame")
+	row.Size = UDim2.new(1, -6, 0, 0)
+	row.AutomaticSize = Enum.AutomaticSize.Y
+	row.BackgroundColor3 = COL.row
+	row.BorderSizePixel = 0
+	row.LayoutOrder = -counter -- newest on top
+	row.Parent = lists[kind]
+	local rowLayout = Instance.new("UIListLayout", row)
+	rowLayout.Padding = UDim.new(0, 3)
+	rowLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(1, 0, 0, 0)
+	label.AutomaticSize = Enum.AutomaticSize.Y
+	label.BackgroundTransparency = 1
+	label.RichText = true
+	label.TextWrapped = true
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.TextYAlignment = Enum.TextYAlignment.Top
+	label.Font = Enum.Font.Code
+	label.TextSize = 12
+	label.TextColor3 = COL.text
+	label.LayoutOrder = 1
+	Instance.new("UIPadding", label).PaddingLeft = UDim.new(0, 4)
+	label.Parent = row
+
+	local function render(extra)
+		local text = string.format("<b>%s</b>\n%s", esc(title), esc(detail))
+		if extra then
+			text ..= string.format('\n<font color="#8fd3ff">%s</font>', esc(extra))
+		end
+		label.Text = text
+	end
+	render()
+
+	local btnRow = Instance.new("Frame")
+	btnRow.Size = UDim2.new(1, -4, 0, 0)
+	btnRow.AutomaticSize = Enum.AutomaticSize.Y
+	btnRow.BackgroundTransparency = 1
+	btnRow.LayoutOrder = 2
+	btnRow.Parent = row
+	local grid = Instance.new("UIGridLayout", btnRow)
+	grid.CellSize = UDim2.new(0.25, -3, 0, 22)
+	grid.CellPadding = UDim2.new(0, 3, 0, 3)
+	grid.SortOrder = Enum.SortOrder.LayoutOrder
+	Instance.new("UIPadding", btnRow).PaddingBottom = UDim.new(0, 3)
+
+	for i, a in ipairs(actions) do
+		local b = Instance.new("TextButton")
+		b.LayoutOrder = i
+		b.BackgroundColor3 = a.color or COL.blue
+		b.BorderSizePixel = 0
+		b.Text = a.text or ""
+		b.TextColor3 = Color3.new(1, 1, 1)
+		b.Font = Enum.Font.GothamMedium
+		b.TextScaled = true
+		b.Parent = btnRow
+		Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
+		Instance.new("UITextSizeConstraint", b).MaxTextSize = 12
+
+		if a.state then
+			local function upd()
+				if not b.Parent then return false end
+				local txt, on = a.state()
+				b.Text = txt
+				b.BackgroundColor3 = on and COL.red or (a.color or COL.blue)
+				return true
+			end
+			upd()
+			table.insert(updaters, upd)
+		end
+
+		b.MouseButton1Click:Connect(function()
+			local ok, err = pcall(a.fn, b)
+			if not ok then
+				copyBox.Text = "Error: " .. tostring(err)
+				flash(b, "Fail")
+			end
+		end)
+	end
+
+	local q = queues[kind]
+	table.insert(q, row)
+	if #q > MAX_ENTRIES then
+		table.remove(q, 1):Destroy()
+	end
+
+	return { setExtra = function(extra) if label.Parent then render(extra) end end }
+end
+
+local function actCopy(copyText)
+	return { text = "Copy", color = COL.blue, fn = function(btn)
+		toClip(copyText)
+		flash(btn, "Done!")
+	end }
+end
+
+local function actRun(runFn)
+	return { text = "Run", color = COL.green, fn = function(btn)
+		local ok, err = pcall(runFn)
+		if not ok then copyBox.Text = "Run failed: " .. tostring(err) end
+		flash(btn, ok and "Ran!" or "Fail")
+	end }
+end
+
+--// Detailed capture queue ------------------------------------------------
+local function requestDetail(id, cb)
+	if details[id] then
+		if cb then cb(true, details[id]) end
+		return
+	end
+	local job = detailJobs[id]
+	if job then
+		if cb then table.insert(job, cb) end
+		return
+	end
+	detailJobs[id] = { cb }
+	table.insert(detailQueue, id)
+
+	if detailWorking then return end
+	detailWorking = true
+	task.spawn(function()
+		while #detailQueue > 0 do
+			local nextId = table.remove(detailQueue, 1)
+			local ok, res = pcall(captureDetail, nextId)
+			local callbacks = detailJobs[nextId]
+			detailJobs[nextId] = nil
+			if ok then details[nextId] = res end
+			for _, ent in ipairs(entriesById[nextId] or {}) do
+				pcall(ent.setExtra, ok and res.summary or ("Detail failed: " .. tostring(res)))
+			end
+			for _, f in ipairs(callbacks or {}) do pcall(f, ok, res) end
+		end
+		detailWorking = false
+	end)
+end
+
+-- rbxmx: try the real KeyframeSequence first, otherwise fall back to the captured poses
+local function requestRbxmx(id, cb) -- cb(ok, xmlOrError, source)
+	local cached = rbxmxCache[id]
+	if cached then return cb(true, cached.xml, cached.source) end
+	task.spawn(function()
+		local ks = fetchOriginalSequence(id)
+		if ks then
+			local ok, xml = pcall(rbxmxFromInstance, ks)
+			if ok then
+				rbxmxCache[id] = { xml = xml, source = "original" }
+				return cb(true, xml, "original")
+			end
+		end
+		requestDetail(id, function(ok, res)
+			if ok then
+				rbxmxCache[id] = { xml = res.rbxmx, source = "captured" }
+				cb(true, res.rbxmx, "captured")
+			else
+				cb(false, res)
+			end
+		end)
+	end)
+end
+
+detailBtn.MouseButton1Click:Connect(function()
+	detailedMode = not detailedMode
+	detailBtn.Text = detailedMode and "Detailed: ON" or "Detailed: off"
+	detailBtn.BackgroundColor3 = detailedMode and COL.on or COL.btn
+end)
+
+--// Download / Copy All
+local function buildExport()
+	local out = { "ANIM / VFX LOG - " .. os.date("%Y-%m-%d %H:%M:%S"), "" }
+	for _, kind in ipairs({ "Anim", "VFX" }) do
+		table.insert(out, kind == "Anim" and "=== ANIMATIONS ===" or "=== VFX ===")
+		for i, e in ipairs(exportLog[kind]) do
+			table.insert(out, string.format("[%d] %s\n%s\n", i, e.title, e.detail))
+		end
+		table.insert(out, "")
+	end
+	local any = false
+	for id, d in pairs(details) do
+		if not any then
+			table.insert(out, "=== DETAILED ANIMATION CODE ===")
+			any = true
+		end
+		table.insert(out, "-- ########## " .. id .. " ##########")
+		table.insert(out, d.code)
+		table.insert(out, "")
+	end
+	return table.concat(out, "\n")
+end
+
+dlBtn.MouseButton1Click:Connect(function()
+	local text = buildExport()
+	local name = "AnimVFX_Log_" .. os.date("%Y%m%d_%H%M%S") .. ".txt"
+	if writefile then
+		local ok, err = pcall(writefile, name, text)
+		copyBox.Text = ok and ("Saved: " .. name .. "\n(in your executor's workspace folder)") or ("Save failed: " .. tostring(err))
+		flash(dlBtn, ok and "Saved!" or "Fail")
+	else
+		local copied = toClip(text)
+		flash(dlBtn, copied and "Copied!" or "In box")
+	end
+end)
+
+copyAllBtn.MouseButton1Click:Connect(function()
+	local lines = {}
+	for _, e in ipairs(exportLog[currentTab] or exportLog[lastLogTab]) do table.insert(lines, e.copy) end
+	toClip(table.concat(lines, "\n"))
+	flash(copyAllBtn, "Done!")
+end)
+
+--// Animation logging -----------------------------------------------------
+local watched = {} -- [Animator] = { [track] = true }
+
+local function stopAnimId(id)
+	local n = 0
+	for animator in pairs(watched) do
+		for _, tr in ipairs(animator:GetPlayingAnimationTracks()) do
+			if tr.Animation and tr.Animation.AnimationId == id then
+				tr:Stop(0)
+				n += 1
+			end
+		end
+	end
+	return n
+end
+
+-- Stop Mine: stops animations you started with Run, and a recreated (Detail) script if one is running
+local function stopMine()
+	local n = 0
+	local char = lp.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local animator = hum and hum:FindFirstChildOfClass("Animator")
+	if animator then
+		for _, tr in ipairs(animator:GetPlayingAnimationTracks()) do
+			if ownTracks[tr] then
+				tr:Stop(0)
+				n += 1
+			end
+		end
+	end
+	if _G.StopRecreatedAnim then
+		if pcall(_G.StopRecreatedAnim) then n += 1 end
+		_G.StopRecreatedAnim = nil
+	end
+	return n
+end
+
+stopMineBtn.MouseButton1Click:Connect(function()
+	flash(stopMineBtn, stopMine() > 0 and "Stopped" or "None")
+end)
+
+local function logAnim(animator, track)
+	if ownTracks[track] then return end -- played by our Run / capture
+	local anim = track.Animation
+	local id = anim and anim.AnimationId or "?"
+	if excluded[id] then return end
+	if ownOnly and not isOwn(animator) then return end
+	if blocked[id] then
+		if blockedLogged[id] then return end -- log a blocked anim only once
+		blockedLogged[id] = true
+	end
+
+	animInfo[id] = animInfo[id] or { priority = track.Priority.Name, looped = track.Looped, speed = track.Speed }
+
+	local owner = animator:FindFirstAncestorOfClass("Model")
+	local ownerName = owner and owner.Name or animator.Parent and animator.Parent.Name or "?"
+	animLabel[id] = track.Name .. " / " .. ownerName
+	local detail = string.format(
+		"%s\nTrack: %s | Len: %.2fs | Prio: %s | Loop: %s | Speed: %.2f",
+		id, track.Name, track.Length, track.Priority.Name, tostring(track.Looped), track.Speed
+	)
+
+	local actions = {
+		actCopy(id),
+		actRun(function() playAnim(id) end),
+		{ text = "Stop", color = COL.orange, fn = function(btn)
+			flash(btn, stopAnimId(id) > 0 and "Stopped" or "None")
+		end },
+		{ text = "Code", color = COL.blue, fn = function(btn)
+			toClip(simpleCode(id))
+			flash(btn, "Copied!")
+		end },
+		{ color = COL.purple, state = function() return excluded[id] and "Unexcl" or "Excl", excluded[id] end,
+			fn = function()
+				excluded[id] = not excluded[id] or nil
+				refreshAll()
+			end },
+		{ color = COL.purple, state = function() return blocked[id] and "Unblock" or "Block", blocked[id] end,
+			fn = function()
+				blocked[id] = not blocked[id] or nil
+				if blocked[id] then
+					stopAnimId(id)
+				else
+					blockedLogged[id] = nil
+				end
+				refreshAll()
+			end },
+		{ text = "Detail", color = COL.green, fn = function(btn)
+			if details[id] then
+				toClip(details[id].code)
+				flash(btn, "Copied!")
+				return
+			end
+			btn.Text = "Rec..."
+			requestDetail(id, function(ok, res)
+				if not btn.Parent then return end
+				if ok then
+					toClip(res.code)
+					btn.Text = "Copied!"
+				else
+					copyBox.Text = "Detail failed: " .. tostring(res)
+					btn.Text = "Fail"
+				end
+				task.delay(1, function()
+					if btn.Parent then btn.Text = "Detail" end
+				end)
+			end)
+		end },
+		{ text = "RBXMX", color = COL.green, fn = function(btn)
+			btn.Text = "Working"
+			requestRbxmx(id, function(ok, xml, source)
+				if not btn.Parent then return end
+				if not ok then
+					copyBox.Text = "RBXMX failed: " .. tostring(xml)
+					btn.Text = "Fail"
+				else
+					local fileName = "Anim_" .. (id:match("%d+") or "x") .. ".rbxmx"
+					local howTo = 'game:GetObjects(getcustomasset("' .. fileName .. '"))[1]'
+					if writefile and pcall(writefile, fileName, xml) then
+						copyBox.Text = string.format("Saved %s (%s)\nLoad: %s", fileName, source, howTo)
+						btn.Text = "Saved!"
+					else
+						toClip(xml)
+						btn.Text = "Copied!"
+					end
+				end
+				task.delay(1.5, function()
+					if btn.Parent then btn.Text = "RBXMX" end
+				end)
+			end)
+		end },
+	}
+
+	local ent = addEntry("Anim", id, ownerName, detail, id, actions)
+	if ent then
+		entriesById[id] = entriesById[id] or {}
+		table.insert(entriesById[id], ent)
+		if details[id] then
+			ent.setExtra(details[id].summary)
+		elseif detailedMode and not blocked[id] then
+			requestDetail(id)
+		end
+	end
+end
+
+local function blockIfNeeded(track)
+	if ownTracks[track] then return end
+	local anim = track.Animation
+	if anim and blocked[anim.AnimationId] then track:Stop(0) end
+end
+
+local function watchAnimator(animator)
+	if watched[animator] then return end
+	watched[animator] = {}
+	animator.AnimationPlayed:Connect(blockIfNeeded) -- fast path for blocking
+end
+
+local acc = 0
+RunService.Heartbeat:Connect(function(dt)
+	acc += dt
+	if next(blocked) == nil and acc < POLL_RATE then return end
+	acc = 0
+	for animator, seen in pairs(watched) do
+		if not animator.Parent then
+			watched[animator] = nil
+		else
+			local current = {}
+			for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+				current[track] = true
+				blockIfNeeded(track)
+				if not seen[track] and not paused then
+					seen[track] = true
+					logAnim(animator, track)
+				elseif not seen[track] then
+					seen[track] = true -- remember it so it isn't logged after resume
+				end
+			end
+			for t in pairs(seen) do
+				if not current[t] then seen[t] = nil end
+			end
+		end
+	end
+end)
+
+--// VFX logging -----------------------------------------------------------
+local function describeVFX(inst)
+	local c = inst.ClassName
+	if c == "ParticleEmitter" then
+		return inst.Texture, string.format(
+			"Texture: %s\nRate: %s | Lifetime: %.1f-%.1f | Speed: %.1f-%.1f | Color: %s",
+			inst.Texture, inst.Rate, inst.Lifetime.Min, inst.Lifetime.Max,
+			inst.Speed.Min, inst.Speed.Max, fmtColor(inst.Color.Keypoints[1].Value)
+		)
+	elseif c == "Beam" then
+		return inst.Texture, string.format("Texture: %s\nWidth: %.1f-%.1f | Segments: %d", inst.Texture, inst.Width0, inst.Width1, inst.Segments)
+	elseif c == "Trail" then
+		return inst.Texture, string.format("Texture: %s\nLifetime: %.2f | MinLength: %.2f", inst.Texture, inst.Lifetime, inst.MinLength)
+	elseif c == "Fire" or c == "Smoke" then
+		return "", string.format("Size: %.1f | Color: %s", inst.Size, fmtColor(inst.Color))
+	elseif c == "Explosion" then
+		return "", string.format("BlastRadius: %.1f | BlastPressure: %.0f", inst.BlastRadius, inst.BlastPressure)
+	elseif c == "Highlight" then
+		return "", string.format("Fill: %s | Outline: %s", fmtColor(inst.FillColor), fmtColor(inst.OutlineColor))
+	elseif c:find("Light") then
+		return "", string.format("Brightness: %.1f | Range: %.1f | Color: %s", inst.Brightness, inst.Range, fmtColor(inst.Color))
+	end
+	return "", ""
+end
+
+local function logVFX(inst)
+	if ownOnly and not isOwn(inst) then return end
+	local ok, texture, detail = pcall(describeVFX, inst)
+	if not ok then return end
+	local path = shortPath(inst)
+	local key = inst.ClassName .. "|" .. inst.Name .. "|" .. tostring(texture)
+	if excludedVFX[key] then return end
+	vfxLabel[key] = inst.ClassName .. ": " .. inst.Name
+	local copyText = (texture ~= "" and texture) or (inst.ClassName .. " @ " .. path)
+	addEntry("VFX", key, inst.ClassName .. ": " .. inst.Name, path .. "\n" .. detail, copyText, {
+		actCopy(copyText),
+		actRun(function() playVFX(inst) end),
+		{ color = COL.purple, state = function() return excludedVFX[key] and "Unexcl" or "Excl", excludedVFX[key] end,
+			fn = function()
+				excludedVFX[key] = not excludedVFX[key] or nil
+				refreshAll()
+			end },
+	})
+end
+
+local function watchVFX(inst)
+	if not VFX_CLASSES[inst.ClassName] then return end
+	if inst:GetAttribute("_LoggerClone") then return end -- spawned by our Run / capture
+	logVFX(inst)
+	-- log again when it gets switched on
+	if inst:IsA("ParticleEmitter") or inst:IsA("Beam") or inst:IsA("Trail")
+		or inst:IsA("Fire") or inst:IsA("Smoke") or inst:IsA("Light") or inst:IsA("Sparkles") then
+		inst:GetPropertyChangedSignal("Enabled"):Connect(function()
+			if inst.Enabled then logVFX(inst) end
+		end)
+	end
+end
+
+--// Hook the world --------------------------------------------------------
+for _, d in ipairs(workspace:GetDescendants()) do
+	if d:IsA("Animator") and not d:GetAttribute("_LoggerClone") then watchAnimator(d) end
+end
+
+workspace.DescendantAdded:Connect(function(d)
+	if d:IsA("Animator") then
+		if not d:GetAttribute("_LoggerClone") then watchAnimator(d) end
+	elseif VFX_CLASSES[d.ClassName] then
+		task.defer(watchVFX, d)
+	end
+end)
+
+-- Existing emitters: only log when they switch on / get re-enabled
+for _, d in ipairs(workspace:GetDescendants()) do
+	if d:IsA("ParticleEmitter") then
+		d:GetPropertyChangedSignal("Enabled"):Connect(function()
+			if d.Enabled then logVFX(d) end
+		end)
+	end
+end
+
+refreshAll()
