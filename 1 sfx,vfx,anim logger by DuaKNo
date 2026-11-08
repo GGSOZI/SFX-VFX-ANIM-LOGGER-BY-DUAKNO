@@ -1,13 +1,22 @@
 -- Anim / VFX / SFX Logger (client-side LocalScript) - Dex-style windows
 --
+-- Run it again any time: the old logger window is closed and replaced by the new one.
+-- Tabs: Animations | VFX | SFX | Search (every animation in the game) | Filters | Settings | Console
+-- Search tab: Scan game -> type to filter -> Copy / Full+FX / Preview / VIEW FULL CODE / Capture.
+-- Live preview: plays an animation (+ its recorded FX) on a clone of your character in front of you.
+-- Player filter / Compact mode / window size presets / extra FX capture options: Settings tab.
+-- Defaults: "Own character only" and "Unique only" are ON (turn them off in Settings).
+-- Themes: Settings > Appearance (Dex Dark, Old Logger, Midnight Blue, Dracula, Forest, Crimson,
+--         Ocean, AMOLED Black, Sunset, Solarized Dark). The choice is saved.
+--
 -- Top-bar tabs:  Animations | VFX | SFX | Filters | Settings | Console
 -- Settings (excluded / blocked lists, options, quality, window position) are saved to
 -- "AnimVFXLogger_Settings.json" in your executor's workspace folder and restored next time.
 --
--- ANIM entry:  Copy = frame-by-frame script (no original animation needed)
+-- ANIM entry:  line 1 = the important buttons:  Copy | Full+FX | Run | VIEW FULL CODE
+--              Copy = frame-by-frame script (no original animation needed)
 --              Full+FX = that script + the VFX/SFX that played with the animation
---              Code = plain "play this AnimationId" script    ID = the AnimationId
---              Run / Stop / Block / Excl     VIEW FULL CODE = syntax-colored viewer     RBXMX
+--              line 2 = Code (plain "play this AnimationId" script) | ID | Stop | Block | Excl | RBXMX
 -- VFX entry:   Copy = script that rebuilds the effect from its properties (no asset needed)
 -- SFX entry:   Copy = script that just plays the sound
 -- Every VFX/SFX in a script runs inside pcall - if one fails, the animation still plays.
@@ -26,6 +35,25 @@ local HttpService = game:GetService("HttpService")
 local Debris = game:GetService("Debris")
 local lp = Players.LocalPlayer
 
+--// Single instance: executing the script again replaces the old logger ------------------
+local Run = { alive = true, conns = {} } -- Run.cleanup is assigned once the GUI exists
+local X = { -- extra state + helpers in ONE table (Luau limits a script to 200 locals)
+	filter = "", compact = false, deep = true, thorough = false, guess = false, pre = 3,
+	markers = {}, lastRow = setmetatable({}, { __mode = "k" }), compactButtons = {}, sizeIdx = 2,
+}
+do
+	local env = (getgenv and getgenv()) or _G
+	local prev = env.__AnimVFXLogger
+	if type(prev) == "table" and type(prev.cleanup) == "function" then pcall(prev.cleanup) end
+	local pg = lp:FindFirstChildOfClass("PlayerGui")
+	if pg then
+		for _, old in ipairs(pg:GetChildren()) do
+			if old.Name == "AnimVFXLogger" then pcall(function() old:Destroy() end) end
+		end
+	end
+	env.__AnimVFXLogger = Run
+end
+
 --// Settings ------------------------------------------------------------------
 local SETTINGS_FILE = "AnimVFXLogger_Settings.json"
 local MAX_ENTRIES = 150
@@ -43,15 +71,15 @@ local QUALITY_INFO = {
 
 --// State ---------------------------------------------------------------------
 local paused = false
-local ownOnly = false
-local uniqueOnly = false
+local ownOnly = true -- default ON
+local uniqueOnly = true -- default ON
 local detailedMode = false
 local QUALITY = "Medium"
 local currentTab = "Anim"
-local seenKeys = { Anim = {}, VFX = {}, SFX = {} }
-local queues = { Anim = {}, VFX = {}, SFX = {} }
+local seenKeys = { Anim = {}, VFX = {}, SFX = {}, Search = {} }
+local queues = { Anim = {}, VFX = {}, SFX = {}, Search = {} }
 local counter = 0
-local exportLog = { Anim = {}, VFX = {}, SFX = {} }
+local exportLog = { Anim = {}, VFX = {}, SFX = {}, Search = {} }
 local ownTracks = setmetatable({}, { __mode = "k" }) -- tracks we played ourselves
 local MAX_EXPORT = 2000
 
@@ -113,11 +141,20 @@ if loaded then
 	applyMap(excludedVFX, loaded.excludedVFX, vfxLabel)
 	applyMap(excludedSFX, loaded.excludedSFX, sfxLabel)
 	applyMap(blocked, loaded.blocked, animLabel)
-	if type(loaded.ownOnly) == "boolean" then ownOnly = loaded.ownOnly end
-	if type(loaded.uniqueOnly) == "boolean" then uniqueOnly = loaded.uniqueOnly end
+	-- settings saved by older versions of this script never override the new ON defaults
+	if (tonumber(loaded.version) or 1) >= 2 then
+		if type(loaded.ownOnly) == "boolean" then ownOnly = loaded.ownOnly end
+		if type(loaded.uniqueOnly) == "boolean" then uniqueOnly = loaded.uniqueOnly end
+	end
 	if type(loaded.detailedMode) == "boolean" then detailedMode = loaded.detailedMode end
 	if QUALITY_TOL[loaded.quality] then QUALITY = loaded.quality end
 	if type(loaded.tab) == "string" then currentTab = loaded.tab end
+	if type(loaded.filter) == "string" then X.filter = loaded.filter end
+	if type(loaded.compact) == "boolean" then X.compact = loaded.compact end
+	if type(loaded.deepHook) == "boolean" then X.deep = loaded.deepHook end
+	if type(loaded.thorough) == "boolean" then X.thorough = loaded.thorough end
+	if type(loaded.guessFX) == "boolean" then X.guess = loaded.guessFX end
+	if tonumber(loaded.fxPre) then X.pre = math.clamp(tonumber(loaded.fxPre), 1, 10) end
 end
 
 --// Helpers -------------------------------------------------------------------
@@ -138,6 +175,27 @@ end
 local function isOwn(inst)
 	local char = lp.Character
 	return char ~= nil and inst:IsDescendantOf(char)
+end
+
+-- Player filter (Settings): when set it replaces "Own character only"
+function X.player()
+	local t = X.filter:lower()
+	if t == "" then return nil end
+	local best
+	for _, p in ipairs(Players:GetPlayers()) do
+		local n, d = p.Name:lower(), p.DisplayName:lower()
+		if n == t or d == t then return p end
+		if not best and (n:find(t, 1, true) or d:find(t, 1, true)) then best = p end
+	end
+	return best
+end
+function X.passes(inst)
+	if X.filter ~= "" then
+		local p = X.player()
+		local ch = p and p.Character
+		return ch ~= nil and inst:IsDescendantOf(ch)
+	end
+	return (not ownOnly) or isOwn(inst)
 end
 
 local function countKeys(t)
@@ -1197,27 +1255,206 @@ local function buildAnimCode(id, withFX)
 	if not d then error("not captured yet") end
 	local c = simplified(id)
 	local note = string.format("Frames: %d kept of %d sampled (quality: %s)", c.kept, c.total, QUALITY)
-	return genDetailedCode(id, d.rig, d.length, d.looped, c.joints, withFX and animFX[id] or nil, note)
+		.. (X.keyNote and X.keyNote(id) or "")
+	return genDetailedCode(id, d.rig, d.length, d.looped, c.joints, withFX and fxWindows.liveFor(id) or nil, note)
 end
 
---// GUI (Dex-style) ----------------------------------------------------------------
-local C = {
-	win = Color3.fromRGB(37, 37, 37),
-	title = Color3.fromRGB(50, 50, 50),
-	outline = Color3.fromRGB(92, 92, 92),
-	btn = Color3.fromRGB(62, 62, 62),
-	sel = Color3.fromRGB(11, 90, 175),
-	green = Color3.fromRGB(40, 120, 70),
-	text = Color3.fromRGB(255, 255, 255),
-	sub = Color3.fromRGB(165, 165, 165),
-	row1 = Color3.fromRGB(46, 46, 46),
-	row2 = Color3.fromRGB(41, 41, 41),
-	code = Color3.fromRGB(30, 30, 30),
-	danger = Color3.fromRGB(135, 50, 50),
-	anim = Color3.fromRGB(125, 185, 255),
-	vfx = Color3.fromRGB(255, 170, 90),
-	sfx = Color3.fromRGB(130, 220, 130),
+--// Themes ---------------------------------------------------------------------------------
+-- Th.cur = active theme. C (below) always holds the active theme's colours.
+-- Th.apply(name) recolours every existing control (matching each colour to its role), so
+-- switching themes does not need a restart.
+local Th = {
+	list = {
+		{ name = "Dex Dark", font = Enum.Font.SourceSans, bold = Enum.Font.SourceSansBold, corner = 0, wcorner = 0, c = {
+			win = Color3.fromRGB(37, 37, 37),
+			title = Color3.fromRGB(50, 50, 50),
+			outline = Color3.fromRGB(92, 92, 92),
+			btn = Color3.fromRGB(62, 62, 62),
+			sel = Color3.fromRGB(11, 90, 175),
+			green = Color3.fromRGB(40, 120, 70),
+			text = Color3.fromRGB(255, 255, 255),
+			sub = Color3.fromRGB(185, 185, 185),
+			row1 = Color3.fromRGB(46, 46, 46),
+			row2 = Color3.fromRGB(41, 41, 41),
+			code = Color3.fromRGB(30, 30, 30),
+			danger = Color3.fromRGB(135, 50, 50),
+			anim = Color3.fromRGB(125, 185, 255),
+			vfx = Color3.fromRGB(255, 170, 90),
+			sfx = Color3.fromRGB(130, 220, 130),
+			con = Color3.fromRGB(170, 230, 170),
+		} },
+		{ name = "Old Logger", font = Enum.Font.GothamMedium, bold = Enum.Font.GothamBold, corner = 5, wcorner = 8, c = {
+			win = Color3.fromRGB(22, 22, 30),
+			title = Color3.fromRGB(40, 40, 58),
+			outline = Color3.fromRGB(64, 64, 96),
+			btn = Color3.fromRGB(50, 50, 70),
+			sel = Color3.fromRGB(80, 80, 140),
+			green = Color3.fromRGB(50, 130, 70),
+			text = Color3.fromRGB(225, 225, 235),
+			sub = Color3.fromRGB(170, 170, 190),
+			row1 = Color3.fromRGB(34, 34, 46),
+			row2 = Color3.fromRGB(28, 28, 38),
+			code = Color3.fromRGB(16, 16, 22),
+			danger = Color3.fromRGB(150, 60, 60),
+			anim = Color3.fromRGB(120, 170, 235),
+			vfx = Color3.fromRGB(230, 160, 80),
+			sfx = Color3.fromRGB(120, 210, 130),
+			con = Color3.fromRGB(200, 255, 200),
+		} },
+		{ name = "Midnight Blue", font = Enum.Font.SourceSans, bold = Enum.Font.SourceSansBold, corner = 4, wcorner = 6, c = {
+			win = Color3.fromRGB(15, 20, 32),
+			title = Color3.fromRGB(24, 33, 54),
+			outline = Color3.fromRGB(50, 68, 105),
+			btn = Color3.fromRGB(36, 50, 82),
+			sel = Color3.fromRGB(37, 99, 235),
+			green = Color3.fromRGB(22, 140, 74),
+			text = Color3.fromRGB(235, 240, 255),
+			sub = Color3.fromRGB(160, 175, 205),
+			row1 = Color3.fromRGB(20, 28, 46),
+			row2 = Color3.fromRGB(17, 24, 40),
+			code = Color3.fromRGB(10, 14, 24),
+			danger = Color3.fromRGB(190, 60, 70),
+			anim = Color3.fromRGB(110, 170, 255),
+			vfx = Color3.fromRGB(255, 175, 95),
+			sfx = Color3.fromRGB(110, 225, 150),
+			con = Color3.fromRGB(150, 230, 190),
+		} },
+		{ name = "Dracula", font = Enum.Font.SourceSans, bold = Enum.Font.SourceSansBold, corner = 4, wcorner = 6, c = {
+			win = Color3.fromRGB(40, 42, 54),
+			title = Color3.fromRGB(33, 34, 44),
+			outline = Color3.fromRGB(98, 114, 164),
+			btn = Color3.fromRGB(68, 71, 90),
+			sel = Color3.fromRGB(118, 98, 190),
+			green = Color3.fromRGB(60, 140, 80),
+			text = Color3.fromRGB(248, 248, 242),
+			sub = Color3.fromRGB(180, 185, 210),
+			row1 = Color3.fromRGB(49, 51, 66),
+			row2 = Color3.fromRGB(43, 45, 58),
+			code = Color3.fromRGB(30, 31, 41),
+			danger = Color3.fromRGB(170, 60, 80),
+			anim = Color3.fromRGB(139, 233, 253),
+			vfx = Color3.fromRGB(255, 184, 108),
+			sfx = Color3.fromRGB(80, 250, 123),
+			con = Color3.fromRGB(150, 240, 170),
+		} },
+		{ name = "Forest", font = Enum.Font.SourceSans, bold = Enum.Font.SourceSansBold, corner = 4, wcorner = 6, c = {
+			win = Color3.fromRGB(24, 32, 26),
+			title = Color3.fromRGB(34, 48, 38),
+			outline = Color3.fromRGB(70, 100, 76),
+			btn = Color3.fromRGB(46, 64, 50),
+			sel = Color3.fromRGB(52, 120, 110),
+			green = Color3.fromRGB(46, 125, 50),
+			text = Color3.fromRGB(232, 244, 232),
+			sub = Color3.fromRGB(160, 185, 165),
+			row1 = Color3.fromRGB(30, 42, 33),
+			row2 = Color3.fromRGB(26, 36, 29),
+			code = Color3.fromRGB(18, 25, 20),
+			danger = Color3.fromRGB(150, 55, 50),
+			anim = Color3.fromRGB(120, 200, 230),
+			vfx = Color3.fromRGB(240, 180, 90),
+			sfx = Color3.fromRGB(150, 230, 120),
+			con = Color3.fromRGB(170, 235, 170),
+		} },
+		{ name = "Crimson", font = Enum.Font.SourceSans, bold = Enum.Font.SourceSansBold, corner = 4, wcorner = 6, c = {
+			win = Color3.fromRGB(32, 22, 24),
+			title = Color3.fromRGB(52, 30, 34),
+			outline = Color3.fromRGB(110, 60, 66),
+			btn = Color3.fromRGB(66, 40, 44),
+			sel = Color3.fromRGB(170, 40, 55),
+			green = Color3.fromRGB(50, 130, 70),
+			text = Color3.fromRGB(255, 240, 240),
+			sub = Color3.fromRGB(200, 170, 175),
+			row1 = Color3.fromRGB(42, 28, 31),
+			row2 = Color3.fromRGB(37, 25, 28),
+			code = Color3.fromRGB(24, 16, 18),
+			danger = Color3.fromRGB(125, 70, 30),
+			anim = Color3.fromRGB(130, 190, 255),
+			vfx = Color3.fromRGB(255, 170, 90),
+			sfx = Color3.fromRGB(140, 225, 140),
+			con = Color3.fromRGB(240, 200, 170),
+		} },
+		{ name = "Ocean", font = Enum.Font.GothamMedium, bold = Enum.Font.GothamBold, corner = 6, wcorner = 8, c = {
+			win = Color3.fromRGB(14, 34, 40),
+			title = Color3.fromRGB(20, 52, 62),
+			outline = Color3.fromRGB(45, 100, 115),
+			btn = Color3.fromRGB(28, 70, 82),
+			sel = Color3.fromRGB(0, 128, 150),
+			green = Color3.fromRGB(30, 140, 90),
+			text = Color3.fromRGB(230, 250, 252),
+			sub = Color3.fromRGB(150, 195, 205),
+			row1 = Color3.fromRGB(18, 44, 52),
+			row2 = Color3.fromRGB(16, 38, 45),
+			code = Color3.fromRGB(9, 24, 29),
+			danger = Color3.fromRGB(150, 60, 60),
+			anim = Color3.fromRGB(120, 200, 255),
+			vfx = Color3.fromRGB(255, 190, 110),
+			sfx = Color3.fromRGB(120, 235, 170),
+			con = Color3.fromRGB(150, 240, 220),
+		} },
+		{ name = "AMOLED Black", font = Enum.Font.SourceSans, bold = Enum.Font.SourceSansBold, corner = 0, wcorner = 0, c = {
+			win = Color3.fromRGB(0, 0, 0),
+			title = Color3.fromRGB(18, 18, 18),
+			outline = Color3.fromRGB(60, 60, 60),
+			btn = Color3.fromRGB(32, 32, 32),
+			sel = Color3.fromRGB(0, 110, 220),
+			green = Color3.fromRGB(30, 130, 60),
+			text = Color3.fromRGB(255, 255, 255),
+			sub = Color3.fromRGB(170, 170, 170),
+			row1 = Color3.fromRGB(16, 16, 16),
+			row2 = Color3.fromRGB(9, 9, 9),
+			code = Color3.fromRGB(4, 4, 4),
+			danger = Color3.fromRGB(140, 40, 40),
+			anim = Color3.fromRGB(110, 170, 255),
+			vfx = Color3.fromRGB(255, 170, 80),
+			sfx = Color3.fromRGB(110, 230, 130),
+			con = Color3.fromRGB(160, 230, 160),
+		} },
+		{ name = "Sunset", font = Enum.Font.GothamMedium, bold = Enum.Font.GothamBold, corner = 6, wcorner = 8, c = {
+			win = Color3.fromRGB(38, 28, 36),
+			title = Color3.fromRGB(60, 38, 52),
+			outline = Color3.fromRGB(120, 80, 96),
+			btn = Color3.fromRGB(78, 52, 66),
+			sel = Color3.fromRGB(214, 90, 60),
+			green = Color3.fromRGB(60, 140, 80),
+			text = Color3.fromRGB(255, 244, 236),
+			sub = Color3.fromRGB(210, 180, 180),
+			row1 = Color3.fromRGB(48, 34, 44),
+			row2 = Color3.fromRGB(42, 30, 39),
+			code = Color3.fromRGB(28, 20, 27),
+			danger = Color3.fromRGB(130, 40, 70),
+			anim = Color3.fromRGB(140, 190, 255),
+			vfx = Color3.fromRGB(255, 200, 100),
+			sfx = Color3.fromRGB(150, 230, 150),
+			con = Color3.fromRGB(255, 215, 170),
+		} },
+		{ name = "Solarized Dark", font = Enum.Font.SourceSans, bold = Enum.Font.SourceSansBold, corner = 3, wcorner = 5, c = {
+			win = Color3.fromRGB(0, 43, 54),
+			title = Color3.fromRGB(7, 54, 66),
+			outline = Color3.fromRGB(88, 110, 117),
+			btn = Color3.fromRGB(16, 68, 82),
+			sel = Color3.fromRGB(38, 139, 210),
+			green = Color3.fromRGB(90, 125, 10),
+			text = Color3.fromRGB(238, 232, 213),
+			sub = Color3.fromRGB(160, 175, 175),
+			row1 = Color3.fromRGB(4, 50, 62),
+			row2 = Color3.fromRGB(2, 46, 58),
+			code = Color3.fromRGB(0, 34, 43),
+			danger = Color3.fromRGB(180, 60, 50),
+			anim = Color3.fromRGB(120, 190, 240),
+			vfx = Color3.fromRGB(230, 160, 60),
+			sfx = Color3.fromRGB(150, 200, 70),
+			con = Color3.fromRGB(150, 220, 180),
+		} },
+	},
 }
+Th.byName = {}
+for _, t in ipairs(Th.list) do Th.byName[t.name] = t end
+Th.cur = Th.byName[loaded and loaded.theme or ""] or Th.list[1]
+Th.font, Th.bold = Th.cur.font, Th.cur.bold
+Th.rerender = {} -- functions that rebuild rich-text labels (they embed colours)
+
+local C = {}
+for role, col in pairs(Th.cur.c) do C[role] = col end
 
 local function hex(c)
 	return string.format("#%02x%02x%02x", c.R * 255, c.G * 255, c.B * 255)
@@ -1230,7 +1467,95 @@ gui.IgnoreGuiInset = true
 gui.DisplayOrder = 999
 gui.Parent = lp:WaitForChild("PlayerGui")
 
+local CORNER_CLASSES = { Frame = true, TextButton = true, TextLabel = true, TextBox = true, ScrollingFrame = true }
+function Th.styleCorner(o)
+	if not CORNER_CLASSES[o.ClassName] or o:GetAttribute("NoCorner") then return end
+	local uc = o:FindFirstChildOfClass("UICorner")
+	local r = o:GetAttribute("WinCorner") and Th.cur.wcorner or Th.cur.corner
+	if o.BackgroundTransparency >= 1 or r <= 0 then
+		if uc then uc:Destroy() end
+		return
+	end
+	if not uc then
+		uc = Instance.new("UICorner")
+		uc.Parent = o
+	end
+	uc.CornerRadius = UDim.new(0, r)
+end
+table.insert(Run.conns, gui.DescendantAdded:Connect(function(o) Th.styleCorner(o) end))
+
+function Th.remap(col)
+	for _, t in ipairs(Th.list) do
+		for role, c in pairs(t.c) do
+			if c == col then return C[role] end
+		end
+	end
+	return col
+end
+
 local baseColor = setmetatable({}, { __mode = "k" })
+local rowBase = setmetatable({}, { __mode = "k" })
+
+function Th.apply(name)
+	local new = Th.byName[name]
+	if not new then return end
+	local function key(c) return string.format("%.4f,%.4f,%.4f", c.R, c.G, c.B) end
+	local map = {}
+	for role, oc in pairs(C) do
+		if new.c[role] then map[key(oc)] = new.c[role] end
+	end
+	local function m(c) return map[key(c)] end
+	local oldFont, oldBold = Th.font, Th.bold
+
+	for _, o in ipairs(gui:GetDescendants()) do
+		if o:IsA("GuiObject") then
+			local n = m(o.BackgroundColor3)
+			if n then o.BackgroundColor3 = n end
+			if o:IsA("TextLabel") or o:IsA("TextButton") or o:IsA("TextBox") then
+				local t = m(o.TextColor3)
+				if t then o.TextColor3 = t end
+				if o.Font == oldBold then o.Font = new.bold elseif o.Font == oldFont then o.Font = new.font end
+				if o:IsA("TextBox") then
+					local p = m(o.PlaceholderColor3)
+					if p then o.PlaceholderColor3 = p end
+				end
+			end
+		elseif o:IsA("UIStroke") then
+			local n = m(o.Color)
+			if n then o.Color = n end
+		end
+	end
+	for obj, col in pairs(baseColor) do
+		local n = m(col)
+		if n then baseColor[obj] = n end
+	end
+	for obj, col in pairs(rowBase) do
+		local n = m(col)
+		if n then rowBase[obj] = n end
+	end
+
+	Th.cur, Th.font, Th.bold = new, new.font, new.bold
+	for role, col in pairs(new.c) do C[role] = col end
+	for _, o in ipairs(gui:GetDescendants()) do Th.styleCorner(o) end
+	for i = #Th.rerender, 1, -1 do
+		local ok, alive = pcall(Th.rerender[i])
+		if not ok or not alive then table.remove(Th.rerender, i) end
+	end
+end
+
+function Th.refreshRows()
+	for i = #Th.rerender, 1, -1 do
+		local ok, alive = pcall(Th.rerender[i])
+		if not ok or not alive then table.remove(Th.rerender, i) end
+	end
+end
+
+function X.setCompact(on)
+	X.compact = on and true or false
+	Th.refreshRows()
+	syncUI()
+end
+
 local function paint(b, color)
 	baseColor[b] = color
 	b.BackgroundColor3 = color
@@ -1242,8 +1567,8 @@ local function newButton(parent, text, color)
 	b.BorderSizePixel = 0
 	b.Text = text
 	b.TextColor3 = C.text
-	b.Font = Enum.Font.SourceSans
-	b.TextSize = 14
+	b.Font = Th.font
+	b.TextSize = 16
 	paint(b, color or C.btn)
 	b.MouseEnter:Connect(function()
 		b.BackgroundColor3 = baseColor[b]:Lerp(Color3.new(1, 1, 1), 0.12)
@@ -1303,6 +1628,7 @@ local function createWindow(opts)
 
 	local frame = Instance.new("Frame")
 	frame.Name = opts.title
+	frame:SetAttribute("WinCorner", true)
 	frame.Size = UDim2.fromOffset(opts.size.X, opts.size.Y)
 	frame.Position = opts.pos
 	frame.BackgroundColor3 = C.win
@@ -1316,35 +1642,36 @@ local function createWindow(opts)
 	stroke.Parent = frame
 
 	local titleBar = Instance.new("Frame")
-	titleBar.Size = UDim2.new(1, 0, 0, 22)
+	titleBar.Size = UDim2.new(1, 0, 0, 28)
+	titleBar:SetAttribute("NoCorner", true)
 	titleBar.BackgroundColor3 = C.title
 	titleBar.BorderSizePixel = 0
 	titleBar.Parent = frame
 
 	local titleLbl = Instance.new("TextLabel")
 	titleLbl.Position = UDim2.new(0, 8, 0, 0)
-	titleLbl.Size = UDim2.new(1, -60, 1, 0)
+	titleLbl.Size = UDim2.new(1, -72, 1, 0)
 	titleLbl.BackgroundTransparency = 1
 	titleLbl.Text = opts.title
 	titleLbl.TextColor3 = C.text
-	titleLbl.Font = Enum.Font.SourceSansBold
-	titleLbl.TextSize = 14
+	titleLbl.Font = Th.bold
+	titleLbl.TextSize = 16
 	titleLbl.TextXAlignment = Enum.TextXAlignment.Left
 	titleLbl.TextTruncate = Enum.TextTruncate.AtEnd
 	titleLbl.Parent = titleBar
 
 	local minBtn = newButton(titleBar, "-", C.title)
-	minBtn.Size = UDim2.new(0, 22, 0, 22)
-	minBtn.Position = UDim2.new(1, -44, 0, 0)
+	minBtn.Size = UDim2.new(0, 28, 0, 28)
+	minBtn.Position = UDim2.new(1, -56, 0, 0)
 	minBtn.TextSize = 18
 
 	local closeBtn = newButton(titleBar, "X", C.title)
-	closeBtn.Size = UDim2.new(0, 22, 0, 22)
-	closeBtn.Position = UDim2.new(1, -22, 0, 0)
+	closeBtn.Size = UDim2.new(0, 28, 0, 28)
+	closeBtn.Position = UDim2.new(1, -28, 0, 0)
 
 	local content = Instance.new("Frame")
-	content.Position = UDim2.new(0, 0, 0, 22)
-	content.Size = UDim2.new(1, 0, 1, -22)
+	content.Position = UDim2.new(0, 0, 0, 28)
+	content.Size = UDim2.new(1, 0, 1, -28)
 	content.BackgroundTransparency = 1
 	content.Parent = frame
 
@@ -1362,6 +1689,7 @@ local function createWindow(opts)
 		dot.Position = UDim2.fromOffset(p[1], p[2])
 		dot.BackgroundColor3 = C.sub
 		dot.BorderSizePixel = 0
+		dot:SetAttribute("NoCorner", true)
 		dot.ZIndex = 21
 		dot.Parent = grip
 	end
@@ -1387,9 +1715,9 @@ local function createWindow(opts)
 
 	-- minimized square
 	local mini = newButton(gui, opts.miniText or "+", C.title)
-	mini.Size = UDim2.fromOffset(36, 36)
-	mini.Font = Enum.Font.SourceSansBold
-	mini.TextSize = 15
+	mini.Size = UDim2.fromOffset(40, 40)
+	mini.Font = Th.bold
+	mini.TextSize = 17
 	mini.Visible = false
 	local miniStroke = Instance.new("UIStroke")
 	miniStroke.Color = C.outline
@@ -1510,7 +1838,7 @@ local function highlightLine(line)
 	return table.concat(out)
 end
 
-local CODE_TEXT_SIZE, LINE_H = 14, 16
+local CODE_TEXT_SIZE, LINE_H = 15, 18
 local CHAR_W = 8
 pcall(function()
 	CHAR_W = TextService:GetTextSize("0000000000", CODE_TEXT_SIZE, Enum.Font.Code, Vector2.new(10000, 100)).X / 10
@@ -1664,13 +1992,13 @@ local function openViewer(titleText, variants, startIndex)
 	local content = win.content
 
 	local bar = Instance.new("Frame")
-	bar.Size = UDim2.new(1, -8, 0, 24)
-	bar.Position = UDim2.new(0, 4, 0, 3)
+	bar.Size = UDim2.new(1, -8, 0, 30)
+	bar.Position = UDim2.new(0, 4, 0, 4)
 	bar.BackgroundTransparency = 1
 	bar.Parent = content
 
 	local tabsRow = Instance.new("Frame")
-	tabsRow.Size = UDim2.new(1, -244, 1, 0)
+	tabsRow.Size = UDim2.new(1, -262, 1, 0)
 	tabsRow.BackgroundTransparency = 1
 	tabsRow.Parent = bar
 	local tabLayout = Instance.new("UIListLayout")
@@ -1679,26 +2007,26 @@ local function openViewer(titleText, variants, startIndex)
 	tabLayout.Parent = tabsRow
 
 	local qualityBtn = newButton(bar, "Quality: " .. QUALITY, C.btn)
-	qualityBtn.Size = UDim2.new(0, 108, 1, 0)
-	qualityBtn.Position = UDim2.new(1, -240, 0, 0)
+	qualityBtn.Size = UDim2.new(0, 120, 1, 0)
+	qualityBtn.Position = UDim2.new(1, -258, 0, 0)
 
-	local runBtn = newButton(bar, "Run", Color3.fromRGB(46, 125, 50))
-	runBtn.Size = UDim2.new(0, 60, 1, 0)
-	runBtn.Position = UDim2.new(1, -124, 0, 0)
+	local runBtn = newButton(bar, "Run", C.green)
+	runBtn.Size = UDim2.new(0, 64, 1, 0)
+	runBtn.Position = UDim2.new(1, -134, 0, 0)
 
 	local copyBtn = newButton(bar, "Copy", C.sel)
-	copyBtn.Size = UDim2.new(0, 60, 1, 0)
-	copyBtn.Position = UDim2.new(1, -60, 0, 0)
+	copyBtn.Size = UDim2.new(0, 64, 1, 0)
+	copyBtn.Position = UDim2.new(1, -64, 0, 0)
 
-	local view = createCodeView(content, UDim2.new(0, 4, 0, 31), UDim2.new(1, -8, 1, -54))
+	local view = createCodeView(content, UDim2.new(0, 4, 0, 38), UDim2.new(1, -8, 1, -68))
 
 	local status = Instance.new("TextLabel")
-	status.Position = UDim2.new(0, 6, 1, -20)
-	status.Size = UDim2.new(1, -210, 0, 18)
+	status.Position = UDim2.new(0, 6, 1, -26)
+	status.Size = UDim2.new(1, -250, 0, 22)
 	status.BackgroundTransparency = 1
 	status.TextColor3 = C.sub
-	status.Font = Enum.Font.SourceSans
-	status.TextSize = 13
+	status.Font = Th.font
+	status.TextSize = 15
 	status.TextXAlignment = Enum.TextXAlignment.Left
 	status.Text = ""
 	status.Parent = content
@@ -1706,9 +2034,9 @@ local function openViewer(titleText, variants, startIndex)
 	-- easy scrolling: jump buttons (long scripts are painful to drag)
 	local function nav(label, xOff, fn)
 		local b = newButton(content, label, C.btn)
-		b.Size = UDim2.new(0, 40, 0, 18)
-		b.Position = UDim2.new(1, xOff, 1, -21)
-		b.TextSize = 12
+		b.Size = UDim2.new(0, 46, 0, 24)
+		b.Position = UDim2.new(1, xOff, 1, -27)
+		b.TextSize = 14
 		b.MouseButton1Click:Connect(function()
 			local sf = view.frame
 			local maxY = math.max(sf.CanvasSize.Y.Offset - sf.AbsoluteSize.Y, 0)
@@ -1716,10 +2044,10 @@ local function openViewer(titleText, variants, startIndex)
 			sf.CanvasPosition = Vector2.new(sf.CanvasPosition.X, math.clamp(fn(sf.CanvasPosition.Y, page, maxY), 0, maxY))
 		end)
 	end
-	nav("Top", -188, function() return 0 end)
-	nav("PgUp", -146, function(y, page) return y - page end)
-	nav("PgDn", -104, function(y, page) return y + page end)
-	nav("End", -62, function(_, _, maxY) return maxY end)
+	nav("Top", -218, function() return 0 end)
+	nav("PgUp", -168, function(y, page) return y - page end)
+	nav("PgDn", -118, function(y, page) return y + page end)
+	nav("End", -68, function(_, _, maxY) return maxY end)
 	local current, token, currentIndex = nil, 0, startIndex or 1
 	local tabButtonsV = {}
 
@@ -1766,7 +2094,7 @@ local function openViewer(titleText, variants, startIndex)
 
 	for i, v in ipairs(variants) do
 		local b = newButton(tabsRow, v.name, C.btn)
-		b.Size = UDim2.new(0, 84, 1, 0)
+		b.Size = UDim2.new(0, 92, 1, 0)
 		b.MouseButton1Click:Connect(function() show(i) end)
 		tabButtonsV[i] = b
 	end
@@ -1811,8 +2139,8 @@ end
 --// Main window -----------------------------------------------------------------------
 local savedWin = loaded and type(loaded.window) == "table" and loaded.window or {}
 local viewport = (workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize) or Vector2.new(900, 600)
-local winW = math.clamp(tonumber(savedWin.w) or 470, 360, math.max(viewport.X - 10, 360))
-local winH = math.clamp(tonumber(savedWin.h) or 520, 340, math.max(viewport.Y - 10, 340))
+local winW = math.clamp(tonumber(savedWin.w) or 520, 360, math.max(viewport.X - 10, 360))
+local winH = math.clamp(tonumber(savedWin.h) or 600, 340, math.max(viewport.Y - 10, 340))
 local winPos = UDim2.new(0.5, -winW / 2, 0.5, -winH / 2)
 if tonumber(savedWin.x) and tonumber(savedWin.y) then
 	winPos = UDim2.fromOffset(
@@ -1839,12 +2167,12 @@ local content = mainWin.content
 
 -- status line (bottom)
 local statusLbl = Instance.new("TextLabel")
-statusLbl.Position = UDim2.new(0, 8, 1, -20)
-statusLbl.Size = UDim2.new(1, -30, 0, 18)
+statusLbl.Position = UDim2.new(0, 8, 1, -24)
+statusLbl.Size = UDim2.new(1, -30, 0, 20)
 statusLbl.BackgroundTransparency = 1
 statusLbl.TextColor3 = C.sub
-statusLbl.Font = Enum.Font.SourceSans
-statusLbl.TextSize = 13
+statusLbl.Font = Th.font
+statusLbl.TextSize = 15
 statusLbl.TextXAlignment = Enum.TextXAlignment.Left
 statusLbl.TextTruncate = Enum.TextTruncate.AtEnd
 statusLbl.Text = "Ready."
@@ -1871,8 +2199,8 @@ end
 
 -- top-bar tabs
 local tabBar = Instance.new("ScrollingFrame")
-tabBar.Position = UDim2.new(0, 4, 0, 3)
-tabBar.Size = UDim2.new(1, -8, 0, 26)
+tabBar.Position = UDim2.new(0, 4, 0, 4)
+tabBar.Size = UDim2.new(1, -8, 0, 30)
 tabBar.BackgroundTransparency = 1
 tabBar.BorderSizePixel = 0
 tabBar.ScrollBarThickness = 0
@@ -1886,13 +2214,13 @@ tabLayout.Padding = UDim.new(0, 3)
 tabLayout.Parent = tabBar
 
 local TAB_DEFS = {
-	{ "Anim", "Animations" }, { "VFX", "VFX" }, { "SFX", "SFX" },
+	{ "Anim", "Animations" }, { "VFX", "VFX" }, { "SFX", "SFX" }, { "Search", "Search" },
 	{ "Filters", "Filters" }, { "Settings", "Settings" }, { "Console", "Console" },
 }
 local tabButtons, tabNames = {}, {}
 for _, def in ipairs(TAB_DEFS) do
 	local b = newButton(tabBar, def[2], C.btn)
-	b.Size = UDim2.new(0, 0, 0, 24)
+	b.Size = UDim2.new(0, 0, 0, 30)
 	b.AutomaticSize = Enum.AutomaticSize.X
 	local pad = Instance.new("UIPadding")
 	pad.PaddingLeft = UDim.new(0, 10)
@@ -1904,8 +2232,8 @@ end
 
 -- pages
 local pageHost = Instance.new("Frame")
-pageHost.Position = UDim2.new(0, 4, 0, 32)
-pageHost.Size = UDim2.new(1, -8, 1, -54)
+pageHost.Position = UDim2.new(0, 4, 0, 40)
+pageHost.Size = UDim2.new(1, -8, 1, -68)
 pageHost.BackgroundTransparency = 1
 pageHost.Parent = content
 
@@ -1926,12 +2254,12 @@ local function newList(parent, position, size)
 	sf.Size = size
 	sf.BackgroundColor3 = C.code
 	sf.BorderSizePixel = 0
-	sf.ScrollBarThickness = 6
+	sf.ScrollBarThickness = 8
 	sf.CanvasSize = UDim2.new()
 	sf.AutomaticCanvasSize = Enum.AutomaticSize.Y
 	sf.Parent = parent
 	local layout = Instance.new("UIListLayout")
-	layout.Padding = UDim.new(0, 2)
+	layout.Padding = UDim.new(0, 4)
 	layout.SortOrder = Enum.SortOrder.LayoutOrder
 	layout.Parent = sf
 	return sf
@@ -1973,11 +2301,12 @@ local function makeLogPage(kind)
 
 	local btns = {}
 	if kind == "Anim" then
-		btns[#btns + 1] = { "Stop Mine", 72, function(b) flash(b, stopMineFn() > 0 and "Stopped" or "None") end }
+		btns[#btns + 1] = { "Stop Mine", 90, function(b) flash(b, stopMineFn() > 0 and "Stopped" or "None") end }
 	end
-	btns[#btns + 1] = { "Pause", 56, "pause" }
-	btns[#btns + 1] = { "Clear", 46, function() clearKind(kind) end }
-	btns[#btns + 1] = { "Copy All", 70, function(b)
+	btns[#btns + 1] = { "Pause", 68, "pause" }
+	btns[#btns + 1] = { "Compact", 82, "compact" }
+	btns[#btns + 1] = { "Clear", 58, function() clearKind(kind) end }
+	btns[#btns + 1] = { "Copy All", 84, function(b)
 		local lines = {}
 		for _, e in ipairs(exportLog[kind]) do table.insert(lines, e.copy) end
 		toClip(table.concat(lines, "\n"), "all " .. kind .. " entries")
@@ -1989,7 +2318,7 @@ local function makeLogPage(kind)
 		local def = btns[i]
 		x += def[2] + 4
 		local b = newButton(page, def[1], C.btn)
-		b.Size = UDim2.new(0, def[2], 0, 24)
+		b.Size = UDim2.new(0, def[2], 0, 30)
 		b.Position = UDim2.new(1, -x + 4, 0, 0)
 		if def[3] == "pause" then
 			pauseButtons[#pauseButtons + 1] = b
@@ -1997,21 +2326,24 @@ local function makeLogPage(kind)
 				paused = not paused
 				syncUI()
 			end)
+		elseif def[3] == "compact" then
+			X.compactButtons[#X.compactButtons + 1] = b
+			b.MouseButton1Click:Connect(function() X.setCompact(not X.compact) end)
 		else
 			b.MouseButton1Click:Connect(function() def[3](b) end)
 		end
 	end
 
 	local search = Instance.new("TextBox")
-	search.Size = UDim2.new(1, -(x + 4), 0, 24)
+	search.Size = UDim2.new(1, -(x + 4), 0, 30)
 	search.BackgroundColor3 = C.code
 	search.BorderSizePixel = 0
 	search.PlaceholderText = "Search..."
 	search.PlaceholderColor3 = C.sub
 	search.Text = ""
 	search.TextColor3 = C.text
-	search.Font = Enum.Font.SourceSans
-	search.TextSize = 14
+	search.Font = Th.font
+	search.TextSize = 16
 	search.TextXAlignment = Enum.TextXAlignment.Left
 	search.ClearTextOnFocus = false
 	search.Parent = page
@@ -2021,7 +2353,7 @@ local function makeLogPage(kind)
 	searchBoxes[kind] = search
 	search:GetPropertyChangedSignal("Text"):Connect(function() applyFilter(kind) end)
 
-	lists[kind] = newList(page, UDim2.new(0, 0, 0, 28), UDim2.new(1, 0, 1, -28))
+	lists[kind] = newList(page, UDim2.new(0, 0, 0, 36), UDim2.new(1, 0, 1, -36))
 end
 makeLogPage("Anim")
 makeLogPage("VFX")
@@ -2033,6 +2365,57 @@ do
 	lists.Filters = newList(page, UDim2.new(0, 0, 0, 0), UDim2.new(1, 0, 1, 0))
 end
 
+-- Search page (every animation in the game)
+do
+	local page = newPage("Search")
+	X.sScan = newButton(page, "Scan game", C.sel)
+	X.sScan.Size = UDim2.new(0, 104, 0, 30)
+	X.sScan.Position = UDim2.new(1, -104, 0, 0)
+	local box = Instance.new("TextBox")
+	box.Size = UDim2.new(1, -110, 0, 30)
+	box.BackgroundColor3 = C.code
+	box.BorderSizePixel = 0
+	box.PlaceholderText = "Search every animation: name, id, path..."
+	box.PlaceholderColor3 = C.sub
+	box.Text = ""
+	box.TextColor3 = C.text
+	box.Font = Th.font
+	box.TextSize = 16
+	box.TextXAlignment = Enum.TextXAlignment.Left
+	box.ClearTextOnFocus = false
+	box.Parent = page
+	local bp = Instance.new("UIPadding")
+	bp.PaddingLeft = UDim.new(0, 6)
+	bp.Parent = box
+	X.sBox = box
+	local info = Instance.new("TextLabel")
+	info.Position = UDim2.new(0, 4, 0, 34)
+	info.Size = UDim2.new(1, -8, 0, 20)
+	info.BackgroundTransparency = 1
+	info.TextColor3 = C.sub
+	info.Font = Th.font
+	info.TextSize = 14
+	info.TextXAlignment = Enum.TextXAlignment.Left
+	info.TextTruncate = Enum.TextTruncate.AtEnd
+	info.Text = "Press Scan game to list every animation in this game."
+	info.Parent = page
+	X.sInfo = info
+	lists.Search = newList(page, UDim2.new(0, 0, 0, 58), UDim2.new(1, 0, 1, -58))
+
+	X.sTok = 0
+	box:GetPropertyChangedSignal("Text"):Connect(function()
+		X.sTok += 1
+		local my = X.sTok
+		task.delay(0.35, function()
+			if my == X.sTok and X.db then X.render() end
+		end)
+	end)
+	box.FocusLost:Connect(function()
+		if X.db then X.render() end
+	end)
+	X.sScan.MouseButton1Click:Connect(function() task.spawn(X.scan) end)
+end
+
 -- Console page
 do
 	local page = newPage("Console")
@@ -2041,9 +2424,9 @@ do
 	outBox.BackgroundColor3 = C.code
 	outBox.BorderSizePixel = 0
 	outBox.Text = "Console - copied scripts and messages appear here.\nSelect the text and copy it if your executor has no clipboard."
-	outBox.TextColor3 = Color3.fromRGB(170, 230, 170)
+	outBox.TextColor3 = C.con
 	outBox.Font = Enum.Font.Code
-	outBox.TextSize = 13
+	outBox.TextSize = 15
 	outBox.TextWrapped = true
 	outBox.TextXAlignment = Enum.TextXAlignment.Left
 	outBox.TextYAlignment = Enum.TextYAlignment.Top
@@ -2061,7 +2444,10 @@ local function setTab(name)
 	for n, b in pairs(tabButtons) do paint(b, n == name and C.sel or C.btn) end
 end
 for name, b in pairs(tabButtons) do
-	b.MouseButton1Click:Connect(function() setTab(name) end)
+	b.MouseButton1Click:Connect(function()
+		setTab(name)
+		if name == "Search" and not X.db and not X.scanning and X.scan then task.spawn(X.scan) end
+	end)
 end
 
 -- Settings page --------------------------------------------------------------------
@@ -2073,14 +2459,14 @@ do
 	local function section(title)
 		order += 1
 		local l = Instance.new("TextLabel")
-		l.Size = UDim2.new(1, -6, 0, 24)
+		l.Size = UDim2.new(1, -6, 0, 30)
 		l.BackgroundColor3 = C.title
 		l.BorderSizePixel = 0
 		l.LayoutOrder = order
 		l.Text = title
 		l.TextColor3 = C.text
-		l.Font = Enum.Font.SourceSansBold
-		l.TextSize = 14
+		l.Font = Th.bold
+		l.TextSize = 16
 		l.TextXAlignment = Enum.TextXAlignment.Left
 		local p = Instance.new("UIPadding")
 		p.PaddingLeft = UDim.new(0, 8)
@@ -2091,44 +2477,44 @@ do
 	local function row(label, desc, btnWidth)
 		order += 1
 		local r = Instance.new("Frame")
-		r.Size = UDim2.new(1, -6, 0, 44)
+		r.Size = UDim2.new(1, -6, 0, 58)
 		r.BackgroundColor3 = order % 2 == 0 and C.row1 or C.row2
 		r.BorderSizePixel = 0
 		r.LayoutOrder = order
 		r.Parent = sf
 
 		local t = Instance.new("TextLabel")
-		t.Position = UDim2.new(0, 8, 0, 3)
-		t.Size = UDim2.new(1, -(btnWidth + 20), 0, 18)
+		t.Position = UDim2.new(0, 8, 0, 4)
+		t.Size = UDim2.new(1, -(btnWidth + 20), 0, 22)
 		t.BackgroundTransparency = 1
 		t.Text = label
 		t.TextColor3 = C.text
-		t.Font = Enum.Font.SourceSansBold
-		t.TextSize = 14
+		t.Font = Th.bold
+		t.TextSize = 16
 		t.TextXAlignment = Enum.TextXAlignment.Left
 		t.Parent = r
 
 		local d = Instance.new("TextLabel")
-		d.Position = UDim2.new(0, 8, 0, 21)
-		d.Size = UDim2.new(1, -(btnWidth + 20), 0, 20)
+		d.Position = UDim2.new(0, 8, 0, 26)
+		d.Size = UDim2.new(1, -(btnWidth + 20), 0, 30)
 		d.BackgroundTransparency = 1
 		d.Text = desc
 		d.TextColor3 = C.sub
-		d.Font = Enum.Font.SourceSans
-		d.TextSize = 12
+		d.Font = Th.font
+		d.TextSize = 14
 		d.TextXAlignment = Enum.TextXAlignment.Left
 		d.TextWrapped = true
 		d.TextYAlignment = Enum.TextYAlignment.Top
 		d.Parent = r
 
 		local b = newButton(r, "", C.btn)
-		b.Size = UDim2.new(0, btnWidth, 0, 26)
-		b.Position = UDim2.new(1, -(btnWidth + 8), 0, 9)
+		b.Size = UDim2.new(0, btnWidth, 0, 32)
+		b.Position = UDim2.new(1, -(btnWidth + 8), 0, 13)
 		return b, d
 	end
 
 	local function toggleRow(label, desc, get, set)
-		local b = row(label, desc, 80)
+		local b = row(label, desc, 84)
 		local function sync()
 			b.Text = get() and "On" or "Off"
 			paint(b, get() and C.sel or C.btn)
@@ -2141,6 +2527,69 @@ do
 		sync()
 	end
 
+	section("Appearance")
+	do
+		order += 1
+		local holder = Instance.new("Frame")
+		holder.Size = UDim2.new(1, -6, 0, 0)
+		holder.AutomaticSize = Enum.AutomaticSize.Y
+		holder.BackgroundColor3 = C.row2
+		holder.BorderSizePixel = 0
+		holder.LayoutOrder = order
+		holder.Parent = sf
+		local holderLayout = Instance.new("UIListLayout")
+		holderLayout.Padding = UDim.new(0, 4)
+		holderLayout.SortOrder = Enum.SortOrder.LayoutOrder
+		holderLayout.Parent = holder
+		local holderPad = Instance.new("UIPadding")
+		holderPad.PaddingLeft = UDim.new(0, 8)
+		holderPad.PaddingRight = UDim.new(0, 8)
+		holderPad.PaddingTop = UDim.new(0, 6)
+		holderPad.PaddingBottom = UDim.new(0, 8)
+		holderPad.Parent = holder
+
+		local cap = Instance.new("TextLabel")
+		cap.Size = UDim2.new(1, 0, 0, 22)
+		cap.BackgroundTransparency = 1
+		cap.LayoutOrder = 1
+		cap.Text = "Theme - applies instantly and is saved"
+		cap.TextColor3 = C.sub
+		cap.Font = Th.font
+		cap.TextSize = 14
+		cap.TextXAlignment = Enum.TextXAlignment.Left
+		cap.Parent = holder
+
+		local grid = Instance.new("Frame")
+		grid.Size = UDim2.new(1, 0, 0, 0)
+		grid.AutomaticSize = Enum.AutomaticSize.Y
+		grid.BackgroundTransparency = 1
+		grid.LayoutOrder = 2
+		grid.Parent = holder
+		local gridLayout = Instance.new("UIGridLayout")
+		gridLayout.CellSize = UDim2.new(0.5, -3, 0, 34)
+		gridLayout.CellPadding = UDim2.new(0, 6, 0, 6)
+		gridLayout.SortOrder = Enum.SortOrder.LayoutOrder
+		gridLayout.Parent = grid
+
+		local themeBtns = {}
+		for i, t in ipairs(Th.list) do
+			local b = newButton(grid, t.name, C.btn)
+			b.LayoutOrder = i
+			themeBtns[t.name] = b
+			b.MouseButton1Click:Connect(function()
+				Th.apply(t.name)
+				setTab(currentTab)
+				refreshAll()
+				syncUI()
+			end)
+		end
+		syncFns[#syncFns + 1] = function()
+			for name, b in pairs(themeBtns) do
+				paint(b, name == Th.cur.name and C.sel or C.btn)
+			end
+		end
+	end
+
 	section("Logging")
 	toggleRow("Own character only", "Only log animations, effects and sounds from your own character.",
 		function() return ownOnly end, function(v) ownOnly = v end)
@@ -2148,6 +2597,132 @@ do
 		function() return uniqueOnly end, function(v) uniqueOnly = v end)
 	toggleRow("Pause logging", "Stop adding new entries (same as the Pause button).",
 		function() return paused end, function(v) paused = v end)
+	toggleRow("Compact mode", "One line per entry; only the first button line is shown.",
+		function() return X.compact end, function(v) X.setCompact(v) end)
+
+	section("Player filter")
+	do
+		local b = row("Player filter", "Only log this player (name or display name, part of it is fine). Empty = use \"Own character only\".", 170)
+		local tb = Instance.new("TextBox")
+		tb.Size = b.Size
+		tb.Position = b.Position
+		tb.BackgroundColor3 = C.code
+		tb.BorderSizePixel = 0
+		tb.PlaceholderText = "everyone"
+		tb.PlaceholderColor3 = C.sub
+		tb.Text = X.filter
+		tb.TextColor3 = C.text
+		tb.Font = Th.font
+		tb.TextSize = 16
+		tb.ClearTextOnFocus = false
+		tb.Parent = b.Parent
+		b:Destroy()
+		tb.FocusLost:Connect(function()
+			local t = tb.Text:gsub("^%s+", "")
+			t = t:gsub("%s+$", "")
+			X.filter = t
+			syncUI()
+		end)
+		syncFns[#syncFns + 1] = function()
+			if not tb:IsFocused() then tb.Text = X.filter end
+		end
+
+		order += 1
+		local holder = Instance.new("Frame")
+		holder.Size = UDim2.new(1, -6, 0, 0)
+		holder.AutomaticSize = Enum.AutomaticSize.Y
+		holder.BackgroundColor3 = C.row2
+		holder.BorderSizePixel = 0
+		holder.LayoutOrder = order
+		holder.Parent = sf
+		local hp = Instance.new("UIPadding")
+		hp.PaddingLeft = UDim.new(0, 8)
+		hp.PaddingRight = UDim.new(0, 8)
+		hp.PaddingTop = UDim.new(0, 8)
+		hp.PaddingBottom = UDim.new(0, 8)
+		hp.Parent = holder
+		local grid = Instance.new("Frame")
+		grid.Size = UDim2.new(1, 0, 0, 0)
+		grid.AutomaticSize = Enum.AutomaticSize.Y
+		grid.BackgroundTransparency = 1
+		grid.Parent = holder
+		local gl = Instance.new("UIGridLayout")
+		gl.CellSize = UDim2.new(0.5, -3, 0, 30)
+		gl.CellPadding = UDim2.new(0, 6, 0, 6)
+		gl.SortOrder = Enum.SortOrder.LayoutOrder
+		gl.Parent = grid
+
+		local pbtns = {}
+		local function rebuild()
+			for _, c in ipairs(grid:GetChildren()) do
+				if c:IsA("GuiButton") then c:Destroy() end
+			end
+			table.clear(pbtns)
+			local list = { { label = "Everyone", name = "" } }
+			for _, p in ipairs(Players:GetPlayers()) do
+				list[#list + 1] = {
+					label = p.DisplayName == p.Name and p.Name or (p.DisplayName .. " (@" .. p.Name .. ")"),
+					name = p.Name,
+				}
+			end
+			for i, it in ipairs(list) do
+				if i > 41 then break end
+				local pb = newButton(grid, it.label, C.btn)
+				pb.LayoutOrder = i
+				pb.TextTruncate = Enum.TextTruncate.AtEnd
+				pb.MouseButton1Click:Connect(function()
+					X.filter = it.name
+					syncUI()
+				end)
+				pbtns[#pbtns + 1] = { pb, it.name }
+			end
+			syncUI()
+		end
+		syncFns[#syncFns + 1] = function()
+			for _, it in ipairs(pbtns) do
+				if it[1].Parent then paint(it[1], X.filter:lower() == it[2]:lower() and C.sel or C.btn) end
+			end
+		end
+		table.insert(Run.conns, Players.PlayerAdded:Connect(function() task.defer(rebuild) end))
+		table.insert(Run.conns, Players.PlayerRemoving:Connect(function() task.defer(rebuild) end))
+		rebuild()
+	end
+
+	section("Effect capture")
+	toggleRow("Deep hook", "Also catch :Emit() and :Play() calls (needs an executor with hookmetamethod). Applies next time you run the script.",
+		function() return X.deep end, function(v) X.deep = v end)
+	toggleRow("Thorough capture", "Also add dormant emitters on the character that have an EmitCount attribute (fired when the animation starts).",
+		function() return X.thorough end, function(v) X.thorough = v end)
+	toggleRow("Related FX guess", "Full+FX also adds effects / sounds found in the same tool or folder as the animation, or named like it (a guess).",
+		function() return X.guess end, function(v) X.guess = v end)
+	do
+		local b, d = row("Look-back", "Seconds of effects remembered from BEFORE an animation is detected.", 100)
+		b.MouseButton1Click:Connect(function()
+			local opts = { 3, 5, 8, 10 }
+			local i = table.find(opts, X.pre) or 0
+			X.pre = opts[i % #opts + 1]
+			syncUI()
+		end)
+		syncFns[#syncFns + 1] = function() b.Text = X.pre .. " s" end
+	end
+
+	section("Window")
+	do
+		local presets = { { "Small", 400, 440 }, { "Medium", 520, 600 }, { "Large", 720, 760 }, { "Fit screen" } }
+		local b = row("Window size", "Drag the grip in the bottom-right corner to resize freely, or cycle through presets.", 130)
+		syncFns[#syncFns + 1] = function() b.Text = presets[X.sizeIdx][1] end
+		b.MouseButton1Click:Connect(function()
+			X.sizeIdx = X.sizeIdx % #presets + 1
+			local p = presets[X.sizeIdx]
+			local vp = (workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize) or Vector2.new(900, 600)
+			local w = p[2] or (vp.X - 20)
+			local h = p[3] or (vp.Y - 20)
+			w, h = math.min(w, vp.X - 10), math.min(h, vp.Y - 10)
+			mainWin.frame.Size = UDim2.fromOffset(w, h)
+			mainWin.frame.Position = UDim2.fromOffset(math.max((vp.X - w) / 2, 0), math.max((vp.Y - h) / 2, 0))
+			syncUI()
+		end)
+	end
 
 	section("Frame-by-frame")
 	toggleRow("Auto-generate", "Build the frame-by-frame data in the background for every new animation.",
@@ -2205,11 +2780,15 @@ do
 		local b = row("Reset window", "Put this window back in the middle of the screen at its default size.", 100)
 		b.Text = "Reset"
 		b.MouseButton1Click:Connect(function()
-			mainWin.frame.Size = UDim2.fromOffset(470, 520)
-			mainWin.frame.Position = UDim2.new(0.5, -235, 0.5, -260)
+			mainWin.frame.Size = UDim2.fromOffset(520, 600)
+			mainWin.frame.Position = UDim2.new(0.5, -260, 0.5, -300)
 			flash(b, "Done!")
 		end)
 	end
+end
+
+syncFns[#syncFns + 1] = function()
+	for _, b in ipairs(X.compactButtons) do paint(b, X.compact and C.sel or C.btn) end
 end
 
 -- keep Pause buttons in sync
@@ -2231,14 +2810,14 @@ local function rebuildFilters()
 	local function header(text)
 		order += 1
 		local l = Instance.new("TextLabel")
-		l.Size = UDim2.new(1, -6, 0, 22)
+		l.Size = UDim2.new(1, -6, 0, 28)
 		l.BackgroundColor3 = C.title
 		l.BorderSizePixel = 0
 		l.LayoutOrder = order
 		l.Text = text
 		l.TextColor3 = C.text
-		l.Font = Enum.Font.SourceSansBold
-		l.TextSize = 14
+		l.Font = Th.bold
+		l.TextSize = 16
 		l.TextXAlignment = Enum.TextXAlignment.Left
 		local p = Instance.new("UIPadding")
 		p.PaddingLeft = UDim.new(0, 8)
@@ -2249,25 +2828,25 @@ local function rebuildFilters()
 	local function addRow(kindColor, title, subtitle, btnText, onClick)
 		order += 1
 		local row = Instance.new("Frame")
-		row.Size = UDim2.new(1, -6, 0, 40)
+		row.Size = UDim2.new(1, -6, 0, 52)
 		row.BackgroundColor3 = order % 2 == 0 and C.row1 or C.row2
 		row.BorderSizePixel = 0
 		row.LayoutOrder = order
 		row.Parent = sf
 
 		local lbl = Instance.new("TextLabel")
-		lbl.Size = UDim2.new(1, -76, 1, 0)
+		lbl.Size = UDim2.new(1, -92, 1, 0)
 		lbl.BackgroundTransparency = 1
 		lbl.RichText = true
 		lbl.TextWrapped = true
 		lbl.TextXAlignment = Enum.TextXAlignment.Left
 		lbl.TextYAlignment = Enum.TextYAlignment.Top
-		lbl.Font = Enum.Font.SourceSans
-		lbl.TextSize = 14
+		lbl.Font = Th.font
+		lbl.TextSize = 16
 		lbl.TextColor3 = C.text
 		lbl.Text = string.format(
-			'<font color="%s"><b>%s</b></font>\n<font color="#a5a5a5">%s</font>',
-			hex(kindColor), esc(title ~= "" and title or "(unnamed)"), esc(subtitle)
+			'<font color="%s"><b>%s</b></font>\n<font color="%s">%s</font>',
+			hex(kindColor), esc(title ~= "" and title or "(unnamed)"), hex(C.sub), esc(subtitle)
 		)
 		local pad = Instance.new("UIPadding")
 		pad.PaddingLeft = UDim.new(0, 8)
@@ -2276,8 +2855,8 @@ local function rebuildFilters()
 		lbl.Parent = row
 
 		local b = newButton(row, btnText, C.btn)
-		b.Size = UDim2.new(0, 66, 0, 24)
-		b.Position = UDim2.new(1, -70, 0, 8)
+		b.Size = UDim2.new(0, 82, 0, 32)
+		b.Position = UDim2.new(1, -88, 0, 10)
 		b.MouseButton1Click:Connect(onClick)
 	end
 
@@ -2289,7 +2868,7 @@ local function rebuildFilters()
 
 	order += 1
 	local resetAll = newButton(sf, "Reset all (unexclude + unblock everything)", C.danger)
-	resetAll.Size = UDim2.new(1, -6, 0, 24)
+	resetAll.Size = UDim2.new(1, -6, 0, 32)
 	resetAll.LayoutOrder = order
 	resetAll.MouseButton1Click:Connect(function()
 		table.clear(excluded)
@@ -2350,12 +2929,11 @@ refreshAll = function()
 end
 
 --// Entries ----------------------------------------------------------------------------
-local rowBase = setmetatable({}, { __mode = "k" })
 local selectedRow
 
 -- actions = { { text=, color=, fn=function(btn) end, state=function() return text, on end }, ... }
 local function addEntry(kind, key, title, detail, copyText, actions, titleColor)
-	if paused then return end
+	if not Run.alive or (paused and kind ~= "Search") then return end
 	if uniqueOnly then
 		if seenKeys[kind][key] then return end
 		seenKeys[kind][key] = true
@@ -2373,16 +2951,16 @@ local function addEntry(kind, key, title, detail, copyText, actions, titleColor)
 	row.AutomaticSize = Enum.AutomaticSize.Y
 	row.BackgroundColor3 = base
 	row.BorderSizePixel = 0
-	row.LayoutOrder = -counter -- newest on top
+	row.LayoutOrder = kind == "Search" and counter or -counter -- newest on top (search: in order)
 	rowBase[row] = base
 	searchOf[row] = (title .. " " .. detail):lower()
 	row.Parent = lists[kind]
 	local rowLayout = Instance.new("UIListLayout")
-	rowLayout.Padding = UDim.new(0, 2)
+	rowLayout.Padding = UDim.new(0, 4)
 	rowLayout.SortOrder = Enum.SortOrder.LayoutOrder
 	rowLayout.Parent = row
 	local rowPad = Instance.new("UIPadding")
-	rowPad.PaddingBottom = UDim.new(0, 3)
+	rowPad.PaddingBottom = UDim.new(0, 5)
 	rowPad.Parent = row
 
 	local label = Instance.new("TextButton")
@@ -2394,13 +2972,13 @@ local function addEntry(kind, key, title, detail, copyText, actions, titleColor)
 	label.TextWrapped = true
 	label.TextXAlignment = Enum.TextXAlignment.Left
 	label.TextYAlignment = Enum.TextYAlignment.Top
-	label.Font = Enum.Font.SourceSans
-	label.TextSize = 14
+	label.Font = Th.font
+	label.TextSize = 16
 	label.TextColor3 = C.text
 	label.LayoutOrder = 1
 	local labelPad = Instance.new("UIPadding")
 	labelPad.PaddingLeft = UDim.new(0, 6)
-	labelPad.PaddingTop = UDim.new(0, 2)
+	labelPad.PaddingTop = UDim.new(0, 4)
 	labelPad.Parent = label
 	label.Parent = row
 
@@ -2410,66 +2988,118 @@ local function addEntry(kind, key, title, detail, copyText, actions, titleColor)
 		row.BackgroundColor3 = C.sel
 	end)
 
+	local lastExtra
+	local lineFrames = {}
 	local function render(extra)
-		local text = string.format(
-			'<font color="%s"><b>%s</b></font>\n<font color="#a5a5a5">%s</font>',
-			hex(titleColor or C.text), esc(title), esc(detail)
-		)
-		if extra then
-			text ..= string.format('\n<font color="#8fd3ff">%s</font>', esc(extra))
+		lastExtra = extra
+		local tcol = hex(titleColor and Th.remap(titleColor) or C.text)
+		local text
+		if X.compact then
+			local first = detail:match("^[^\n]*") or detail
+			text = string.format('<font color="%s"><b>%s</b></font>  <font color="%s">%s</font>', tcol, esc(title), hex(C.sub), esc(first))
+		else
+			text = string.format(
+				'<font color="%s"><b>%s</b></font>\n<font color="%s">%s</font>',
+				tcol, esc(title), hex(C.sub), esc(detail)
+			)
+			if extra then
+				text ..= string.format('\n<font color="#8fd3ff">%s</font>', esc(extra))
+			end
 		end
+		label.TextWrapped = not X.compact
+		label.TextTruncate = X.compact and Enum.TextTruncate.AtEnd or Enum.TextTruncate.None
 		label.Text = text
+		for ln, f in pairs(lineFrames) do f.Visible = (not X.compact) or ln == 1 end
 	end
 	render()
+	table.insert(Th.rerender, function()
+		if not label.Parent then return false end
+		render(lastExtra)
+		return true
+	end)
 
-	local btnRow = Instance.new("Frame")
-	btnRow.Size = UDim2.new(1, -8, 0, 0)
-	btnRow.AutomaticSize = Enum.AutomaticSize.Y
-	btnRow.BackgroundTransparency = 1
-	btnRow.LayoutOrder = 2
-	btnRow.Parent = row
-	local grid = Instance.new("UIGridLayout")
-	grid.CellSize = UDim2.new(0.25, -3, 0, 22)
-	grid.CellPadding = UDim2.new(0, 3, 0, 3)
-	grid.SortOrder = Enum.SortOrder.LayoutOrder
-	grid.Parent = btnRow
-	local btnPad = Instance.new("UIPadding")
-	btnPad.PaddingLeft = UDim.new(0, 6)
-	btnPad.Parent = btnRow
+	local btnHost = Instance.new("Frame")
+	btnHost.Size = UDim2.new(1, -8, 0, 0)
+	btnHost.AutomaticSize = Enum.AutomaticSize.Y
+	btnHost.BackgroundTransparency = 1
+	btnHost.LayoutOrder = 2
+	btnHost.Parent = row
+	local hostLayout = Instance.new("UIListLayout")
+	hostLayout.Padding = UDim.new(0, 4)
+	hostLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	hostLayout.Parent = btnHost
+	local hostPad = Instance.new("UIPadding")
+	hostPad.PaddingLeft = UDim.new(0, 6)
+	hostPad.Parent = btnHost
 
-	for i, a in ipairs(actions) do
-		local b = newButton(btnRow, a.text or "", a.color or C.btn)
-		b.LayoutOrder = i
-		b.TextScaled = true
-		local limit = Instance.new("UITextSizeConstraint")
-		limit.MaxTextSize = 14
-		limit.MinTextSize = 8
-		limit.Parent = b
-
-		if a.state then
-			local function upd()
-				if not b.Parent then return false end
-				local txt, on = a.state()
-				b.Text = txt
-				paint(b, on and C.danger or (a.color or C.btn))
-				return true
-			end
-			upd()
-			table.insert(updaters, upd)
+	-- group the actions into button lines; line 1 holds the important buttons
+	local groups, lineNos = {}, {}
+	for _, a in ipairs(actions) do
+		local ln = a.line or 1
+		if not groups[ln] then
+			groups[ln] = {}
+			lineNos[#lineNos + 1] = ln
 		end
-
-		b.MouseButton1Click:Connect(function()
-			local ok, err = pcall(a.fn, b)
-			if not ok then
-				out("Error: " .. tostring(err))
-				flash(b, "Fail")
-			end
-		end)
+		table.insert(groups[ln], a)
 	end
+	table.sort(lineNos)
+
+	for _, ln in ipairs(lineNos) do
+		local list = groups[ln]
+		local total = 0
+		for _, a in ipairs(list) do total += (a.w or 1) end
+		local gaps = 4 * (#list - 1)
+
+		local lineFrame = Instance.new("Frame")
+		lineFrame.Size = UDim2.new(1, 0, 0, 30)
+		lineFrame.BackgroundTransparency = 1
+		lineFrame.LayoutOrder = ln
+		lineFrames[ln] = lineFrame
+		lineFrame.Parent = btnHost
+		local lineLayout = Instance.new("UIListLayout")
+		lineLayout.FillDirection = Enum.FillDirection.Horizontal
+		lineLayout.SortOrder = Enum.SortOrder.LayoutOrder
+		lineLayout.Padding = UDim.new(0, 4)
+		lineLayout.Parent = lineFrame
+
+		for i, a in ipairs(list) do
+			local frac = (a.w or 1) / total
+			local b = newButton(lineFrame, a.text or "", a.color or C.btn)
+			b.LayoutOrder = i
+			b.Size = UDim2.new(frac, -gaps * frac, 1, 0)
+			b.TextScaled = true
+			local limit = Instance.new("UITextSizeConstraint")
+			limit.MaxTextSize = 16
+			limit.MinTextSize = 10
+			limit.Parent = b
+
+			if a.state then
+				local function upd()
+					if not b.Parent then return false end
+					local txt, on = a.state()
+					b.Text = txt
+					paint(b, on and C.danger or Th.remap(a.color or C.btn))
+					return true
+				end
+				upd()
+				table.insert(updaters, upd)
+			end
+
+			b.MouseButton1Click:Connect(function()
+				local ok, err = pcall(a.fn, b)
+				if not ok then
+					out("Error: " .. tostring(err))
+					flash(b, "Fail")
+				end
+			end)
+		end
+	end
+
+	render(lastExtra)
 
 	local q = queues[kind]
 	table.insert(q, row)
-	if #q > MAX_ENTRIES then
+	if #q > (kind == "Search" and 400 or MAX_ENTRIES) then
 		table.remove(q, 1):Destroy()
 	end
 	updateTabText(kind)
@@ -2478,23 +3108,23 @@ local function addEntry(kind, key, title, detail, copyText, actions, titleColor)
 	return { setExtra = function(extra) if label.Parent then render(extra) end end }
 end
 
-local function act(text, fn, color)
-	return { text = text, fn = fn, color = color }
+local function act(text, fn, color, line, w)
+	return { text = text, fn = fn, color = color, line = line, w = w }
 end
 
-local function copyAct(text, getText, what)
+local function copyAct(text, getText, what, line, w)
 	return act(text, function(btn)
 		toClip(getText(), what)
 		flash(btn, "Copied!")
-	end)
+	end, nil, line, w)
 end
 
-local function runAct(runFn)
+local function runAct(runFn, line, w)
 	return act("Run", function(btn)
 		local ok, err = pcall(runFn)
 		if not ok then out("Run failed: " .. tostring(err)) end
 		flash(btn, ok and "Ran!" or "Fail")
-	end, C.green)
+	end, C.green, line, w)
 end
 
 --// Frame-by-frame generation queue ------------------------------------------------------
@@ -2582,61 +3212,210 @@ local function requestRbxmx(id, cb) -- cb(ok, xmlOrError, source)
 	end)
 end
 
---// FX recording (VFX / SFX that happen while an animation plays) --------------------------
-local function fxBelongs(inst, w)
-	if inst:IsDescendantOf(w.model) then return true end
+--// FX recording (VFX / SFX that happen with an animation) ------------------------------------
+-- Ways the logger makes sure nothing is missed:
+--  1. a rolling buffer remembers every effect/sound near you for the last few seconds, so
+--     effects that fired BEFORE the animation was detected are pulled in when it starts;
+--  2. the recording window runs well past the end of the animation (late effects);
+--  3. effects / sounds that are already running when the animation starts are captured too;
+--  4. the deep hook sees :Emit() and :Play() calls that never change any property;
+--  5. every time the animation plays, new events are MERGED into what was recorded before;
+--  6. keyframe names reached during the animation are saved as a comment in the script;
+--  7. optional: dormant emitters (Thorough) and effects from the same tool/folder (Related guess).
+local FX_POST = 2.5 -- seconds recorded after the animation ends
+fxWindows.buf = {}
+fxWindows.related = {} -- [animId] = guessed events (Related FX guess / Search tab)
+
+fxWindows.pos = function(inst)
 	local part = inst:IsA("BasePart") and inst or inst:FindFirstAncestorWhichIsA("BasePart")
-	if inst:IsA("Sound") and not part then return w.model == lp.Character end
-	local root = w.model:FindFirstChild("HumanoidRootPart")
-	if root and part then return (part.Position - root.Position).Magnitude < 40 end
-	return false
+	if part then return part.Position end
+	local m = inst:FindFirstAncestorOfClass("Model")
+	if m then
+		local ok, p = pcall(m.GetPivot, m)
+		if ok then return p.Position end
+	end
+	return nil
 end
 
-local function recordFX(kind, inst)
-	if #fxWindows == 0 then return end
-	local now = os.clock()
+local function fxBelongs(inst, w, pos)
+	if inst:IsDescendantOf(w.model) then return true end
+	if pos == nil then pos = fxWindows.pos(inst) end
+	if pos == nil then return inst:IsA("Sound") and w.model == lp.Character end
+	local root = w.model:FindFirstChild("HumanoidRootPart")
+	return root ~= nil and (pos - root.Position).Magnitude < 60
+end
+
+-- when a looping effect switches off / gets destroyed, store how long it lasted
+fxWindows.dur = function(inst, ev, since)
+	if ev.kind ~= "vfx" or not ev.enabled or ev.dur then return end
+	local function ended()
+		if not ev.dur then ev.dur = math.max(os.clock() - since, 0.1) end
+	end
+	inst.Destroying:Connect(ended)
+	pcall(function()
+		inst:GetPropertyChangedSignal("Enabled"):Connect(function()
+			if not inst.Enabled then ended() end
+		end)
+	end)
+end
+
+local function evKey(e)
+	local id = ""
+	for _, p in ipairs(e.props or {}) do
+		if p[1] == "SoundId" or p[1] == "Texture" then
+			id = p[2]
+			break
+		end
+	end
+	local bucket = (e.emit and not e.enabled) and 20 or 2 -- bursts keep their exact timing
+	return string.format("%s|%s|%s|%s|%d", e.kind, tostring(e.class), tostring(e.name), id, math.floor(e.t * bucket + 0.5))
+end
+
+-- merge lists of FX events (older list first); copies, so durations can be defaulted safely
+fxWindows.merge = function(...)
+	local out, seen = {}, {}
+	for i = 1, select("#", ...) do
+		local list = select(i, ...)
+		for _, e in ipairs(list or {}) do
+			local k = evKey(e)
+			if not seen[k] and #out < 300 then
+				seen[k] = true
+				local c = table.clone(e)
+				if not c.dur then c.dur = c.kind == "sfx" and 3 or (c.enabled and 1.5 or 1) end
+				out[#out + 1] = c
+			end
+		end
+	end
+	table.sort(out, function(x, y) return x.t < y.t end)
+	return out
+end
+
+-- everything recorded for this animation so far, including windows that are still open
+fxWindows.liveFor = function(id)
+	local old, rel, extra = animFX[id], fxWindows.related[id], {}
 	for _, w in ipairs(fxWindows) do
-		if now >= w.start - 0.2 and now <= w.finish and fxBelongs(inst, w) then
-			local build = kind == "vfx" and buildVFXEvent or buildSFXEvent
-			local ok, ev = pcall(build, inst, w.model, now - w.start)
+		if w.id == id and #w.events > 0 then extra[#extra + 1] = w.events end
+	end
+	if not old and #extra == 0 and not (rel and #rel > 0) then return nil end
+	return fxWindows.merge(old, rel, table.unpack(extra))
+end
+
+-- kind = "vfx" / "sfx"; extra = fields to force on the event (e.g. the real Emit count); at = time of the call
+local function recordFX(kind, inst, extra, at)
+	if kind == "sfx" and tostring(inst.SoundId):find("^rbxasset://sounds/") then return end -- default Roblox sounds
+	local now = at or os.clock()
+	local build = kind == "vfx" and buildVFXEvent or buildSFXEvent
+	local function applyExtra(ev)
+		if extra then
+			for k, v in pairs(extra) do ev[k] = v end
+		end
+	end
+
+	-- 1) rolling history (works even when no animation is being recorded yet)
+	local root = getRoot()
+	local pos = fxWindows.pos(inst)
+	if root and ((pos and (pos - root.Position).Magnitude < 150) or (pos == nil and kind == "sfx")) then
+		local mdl = inst:FindFirstAncestorOfClass("Model") or lp.Character
+		local ok, ev = pcall(build, inst, mdl, 0)
+		if ok and ev then
+			applyExtra(ev)
+			fxWindows.dur(inst, ev, now)
+			local buf = fxWindows.buf
+			buf[#buf + 1] = { kind = kind, ev = ev, at = now, pos = pos, inst = inst }
+			while #buf > 150 or (buf[1] and now - buf[1].at > X.pre + 3) do table.remove(buf, 1) end
+		end
+	end
+
+	-- 2) live recording for animations that are open right now
+	if #fxWindows == 0 then return end
+	for _, w in ipairs(fxWindows) do
+		if now >= w.opened and now <= w.finish and fxBelongs(inst, w, pos) then
+			local ok, ev = pcall(build, inst, w.model, math.max(now - w.start, 0))
 			if ok and ev then
+				applyExtra(ev)
 				table.insert(w.events, ev)
-				if kind == "vfx" and ev.enabled and not ev.dur then
-					local function ended()
-						if not ev.dur then ev.dur = math.max(os.clock() - now, 0.1) end
-					end
-					inst.Destroying:Connect(ended)
-					pcall(function()
-						inst:GetPropertyChangedSignal("Enabled"):Connect(function()
-							if not inst.Enabled then ended() end
-						end)
-					end)
-				end
+				fxWindows.dur(inst, ev, now)
 			end
 		end
 	end
 end
 
 local function finalizeFX(w)
-	for _, e in ipairs(w.events) do
-		if not e.dur then e.dur = e.kind == "sfx" and 3 or (e.enabled and 1.5 or 1) end
+	if w.conn then pcall(function() w.conn:Disconnect() end) end
+	if #w.keys > 0 then
+		local have = X.markers[w.id]
+		if not have or #w.keys > #have then X.markers[w.id] = w.keys end
 	end
 	if #w.events == 0 then return end
-	table.sort(w.events, function(a, b) return a.t < b.t end)
-	local old = animFX[w.id]
-	if not old or #w.events > #old then
-		animFX[w.id] = w.events
-		refreshExtra(w.id)
-	end
+	animFX[w.id] = fxWindows.merge(animFX[w.id], w.events)
+	refreshExtra(w.id)
 end
 
 local function openFXWindow(id, animator, track)
 	local model = animator:FindFirstAncestorOfClass("Model")
 	if not model or #fxWindows >= 20 then return end
+	local now = os.clock()
 	local len = math.min(math.max(track.Length, 0.5), 15)
-	local w = { id = id, model = model, start = os.clock(), finish = os.clock() + len + 1, events = {} }
+	local into = 0
+	pcall(function() into = math.clamp(track.TimePosition, 0, len) end)
+	local w = {
+		id = id, model = model, events = {}, keys = {},
+		start = now - into, -- real start of the animation (we may detect it up to 0.1s late)
+		opened = now,
+		finish = now + math.max(len - into, 0) + FX_POST,
+	}
 	table.insert(fxWindows, w)
-	task.delay(len + 1.3, function()
+	pcall(function()
+		w.conn = track.KeyframeReached:Connect(function(name)
+			w.keys[#w.keys + 1] = { name, os.clock() - w.start }
+		end)
+	end)
+
+	-- effects / sounds that already fired before we noticed the animation
+	for _, item in ipairs(fxWindows.buf) do
+		if item.at >= w.start - X.pre and item.at < now and fxBelongs(item.inst, w, item.pos) then
+			local ev = table.clone(item.ev)
+			ev.t = math.max(item.at - w.start, 0)
+			table.insert(w.events, ev)
+		end
+	end
+
+	-- effects that are already running (or dormant, in Thorough mode) when the animation starts
+	local n = 0
+	for _, d in ipairs(model:GetDescendants()) do
+		if n >= 60 then break end
+		local cls = d.ClassName
+		if d:GetAttribute("_LoggerClone") or d:GetAttribute("_Replay") then
+			-- our own copies: ignore
+		elseif cls == "Sound" then
+			local okS, playing = pcall(function() return d.Playing and not d.Looped and d.SoundId ~= "" and not d.SoundId:find("^rbxasset://sounds/") end)
+			if okS and playing then
+				local ok, ev = pcall(buildSFXEvent, d, model, 0)
+				if ok and ev then
+					n += 1
+					table.insert(w.events, ev)
+				end
+			end
+		elseif VFX_CLASSES[cls] then
+			local okE, en = pcall(function() return d.Enabled end)
+			if okE and en then
+				local ok, ev = pcall(buildVFXEvent, d, model, 0)
+				if ok and ev then
+					n += 1
+					fxWindows.dur(d, ev, now)
+					table.insert(w.events, ev)
+				end
+			elseif cls == "ParticleEmitter" and X.thorough and d:GetAttribute("EmitCount") then
+				local ok, ev = pcall(buildVFXEvent, d, model, tonumber(d:GetAttribute("EmitDelay")) or 0)
+				if ok and ev then
+					n += 1
+					table.insert(w.events, ev)
+				end
+			end
+		end
+	end
+
+	task.delay(math.max(len - into, 0) + FX_POST + 0.3, function()
 		local i = table.find(fxWindows, w)
 		if i then table.remove(fxWindows, i) end
 		finalizeFX(w)
@@ -2680,7 +3459,8 @@ stopMineFn = function()
 end
 
 local function openAnimViewer(id)
-	local hasFX = animFX[id] and #animFX[id] > 0
+	local live = fxWindows.liveFor(id)
+	local hasFX = live and #live > 0
 	openViewer("Anim - " .. (animLabel[id] or id), {
 		{ name = "Frames", get = function(cb, setStatus)
 			requestDetail(id, function(ok, res)
@@ -2707,11 +3487,11 @@ local function openAnimViewer(id)
 end
 
 local function logAnim(animator, track)
-	if ownTracks[track] then return end -- played by our Run / capture
+	if not Run.alive or ownTracks[track] then return end -- played by our Run / capture
 	local anim = track.Animation
 	local id = anim and anim.AnimationId or "?"
 	if excluded[id] then return end
-	if ownOnly and not isOwn(animator) then return end
+	if not X.passes(animator) then return end
 	if blocked[id] then
 		if blockedLogged[id] then return end -- log a blocked anim only once
 		blockedLogged[id] = true
@@ -2729,8 +3509,9 @@ local function logAnim(animator, track)
 
 	openFXWindow(id, animator, track) -- start recording VFX/SFX that happen with this animation
 
-	local function frameButton(text, withFX)
+	local function frameButton(text, withFX, w)
 		return act(text, function(btn)
+			if withFX and X.guess then X.prepareFX({ id = id, name = track.Name, inst = anim }) end
 			if details[id] then
 				local ok, code = pcall(buildAnimCode, id, withFX)
 				if not ok then error(code) end
@@ -2745,7 +3526,7 @@ local function logAnim(animator, track)
 					local okC, code = pcall(buildAnimCode, id, withFX)
 					if okC then
 						toClip(code, "the frame-by-frame script")
-						local fx = animFX[id]
+						local fx = fxWindows.liveFor(id)
 						btn.Text = (withFX and not (fx and #fx > 0)) and "No FX seen" or "Copied!"
 					else
 						out("Failed: " .. tostring(code))
@@ -2759,21 +3540,23 @@ local function logAnim(animator, track)
 					if btn.Parent then btn.Text = text end
 				end)
 			end, function(t) if btn.Parent then btn.Text = t:sub(1, 16) end end)
-		end, C.sel)
+		end, C.sel, 1, w)
 	end
 
 	local actions = {
-		-- row 1: copy
-		frameButton("Copy", false),
-		frameButton("Full+FX", true),
-		copyAct("Code", function() return simpleCode(id) end, "the AnimationId script"),
-		copyAct("ID", function() return id end, "the AnimationId"),
-		-- row 2: play / filter
-		runAct(function() playAnim(id) end),
+		-- line 1: the important buttons
+		frameButton("Copy", false, 1),
+		frameButton("Full+FX", true, 1.3),
+		runAct(function() playAnim(id) end, 1, 0.9),
+		act("VIEW FULL CODE", function() openAnimViewer(id) end, C.sel, 1, 2.2),
+		-- line 2: more
+		copyAct("Code", function() return simpleCode(id) end, "the AnimationId script", 2),
+		copyAct("ID", function() return id end, "the AnimationId", 2),
+		act("Preview", function() X.pvOpen(id, { id = id, name = track.Name, inst = anim }) end, C.green, 2),
 		act("Stop", function(btn)
 			flash(btn, stopAnimId(id) > 0 and "Stopped" or "None")
-		end),
-		{ color = C.btn, state = function() return blocked[id] and "Unblock" or "Block", blocked[id] end,
+		end, nil, 2),
+		{ line = 2, color = C.btn, state = function() return blocked[id] and "Unblock" or "Block", blocked[id] end,
 			fn = function()
 				blocked[id] = not blocked[id] or nil
 				if blocked[id] then
@@ -2783,13 +3566,11 @@ local function logAnim(animator, track)
 				end
 				refreshAll()
 			end },
-		{ color = C.btn, state = function() return excluded[id] and "Unexcl" or "Excl", excluded[id] end,
+		{ line = 2, color = C.btn, state = function() return excluded[id] and "Unexcl" or "Excl", excluded[id] end,
 			fn = function()
 				excluded[id] = not excluded[id] or nil
 				refreshAll()
 			end },
-		-- row 3: view / export
-		act("VIEW FULL CODE", function() openAnimViewer(id) end, C.sel),
 		act("RBXMX", function(btn)
 			btn.Text = "Working..."
 			requestRbxmx(id, function(ok, xml, source)
@@ -2812,7 +3593,7 @@ local function logAnim(animator, track)
 					if btn.Parent then btn.Text = "RBXMX" end
 				end)
 			end)
-		end),
+		end, nil, 2),
 	}
 
 	local ent = addEntry("Anim", id, ownerName, detail, id, actions, C.anim)
@@ -2827,7 +3608,7 @@ local function logAnim(animator, track)
 end
 
 local function blockIfNeeded(track)
-	if ownTracks[track] then return end
+	if not Run.alive or ownTracks[track] then return end
 	local anim = track.Animation
 	if anim and blocked[anim.AnimationId] then track:Stop(0) end
 end
@@ -2839,7 +3620,8 @@ local function watchAnimator(animator)
 end
 
 local acc = 0
-RunService.Heartbeat:Connect(function(dt)
+table.insert(Run.conns, RunService.Heartbeat:Connect(function(dt)
+	if not Run.alive then return end
 	acc += dt
 	if next(blocked) == nil and acc < POLL_RATE then return end
 	acc = 0
@@ -2863,7 +3645,7 @@ RunService.Heartbeat:Connect(function(dt)
 			end
 		end
 	end
-end)
+end))
 
 --// VFX logging --------------------------------------------------------------------------------
 local function describeVFX(inst)
@@ -2891,10 +3673,16 @@ local function describeVFX(inst)
 	return "", ""
 end
 
-local function logVFX(inst)
-	recordFX("vfx", inst) -- attach to any animation playing nearby (regardless of filters)
+local function logVFX(inst, extra, at)
+	if not Run.alive then return end
+	recordFX("vfx", inst, extra, at) -- attach to any animation playing nearby (regardless of filters)
+	if extra then -- from the deep hook: don't add a row for every single Emit
+		local now = os.clock()
+		if now - (X.lastRow[inst] or 0) < 0.5 then return end
+		X.lastRow[inst] = now
+	end
 
-	if ownOnly and not isOwn(inst) then return end
+	if not X.passes(inst) then return end
 	local ok, texture, detail = pcall(describeVFX, inst)
 	if not ok then return end
 	local path = shortPath(inst)
@@ -2912,19 +3700,19 @@ local function logVFX(inst)
 			if not vfxSpec[key] then return flash(btn, "No data") end
 			toClip(script(), "the VFX script")
 			flash(btn, "Copied!")
-		end, C.sel),
-		copyAct("ID", function() return copyText end, "the texture id"),
+		end, C.sel, 1, 1),
+		runAct(function()
+			if not vfxSpec[key] then error("no data captured") end
+			runEvents({ vfxSpec[key] }, "VFX " .. vfxLabel[key])
+		end, 1, 0.9),
 		act("VIEW FULL CODE", function()
 			if not vfxSpec[key] then error("no data captured") end
 			openViewer("VFX - " .. vfxLabel[key], {
 				{ name = "Script", get = function(cb) cb(script()) end },
 			}, 1)
-		end, C.sel),
-		runAct(function()
-			if not vfxSpec[key] then error("no data captured") end
-			runEvents({ vfxSpec[key] }, "VFX " .. vfxLabel[key])
-		end),
-		{ color = C.btn, state = function() return excludedVFX[key] and "Unexcl" or "Excl", excludedVFX[key] end,
+		end, C.sel, 1, 2.2),
+		copyAct("ID", function() return copyText end, "the texture id", 2),
+		{ line = 2, color = C.btn, state = function() return excludedVFX[key] and "Unexcl" or "Excl", excludedVFX[key] end,
 			fn = function()
 				excludedVFX[key] = not excludedVFX[key] or nil
 				refreshAll()
@@ -2947,11 +3735,16 @@ local function watchVFX(inst)
 end
 
 --// SFX logging ----------------------------------------------------------------------------------
-local function logSFX(s)
-	if s.SoundId == "" then return end
-	recordFX("sfx", s)
+local function logSFX(s, at)
+	if not Run.alive or s.SoundId == "" then return end
+	recordFX("sfx", s, nil, at)
+	do
+		local now = os.clock()
+		if now - (X.lastRow[s] or 0) < 0.15 then return end -- Played signal + hook for the same call
+		X.lastRow[s] = now
+	end
 
-	if ownOnly and not isOwn(s) then return end
+	if not X.passes(s) then return end
 	local id = s.SoundId
 	if excludedSFX[id] then return end
 	sfxLabel[id] = s.Name
@@ -2969,19 +3762,19 @@ local function logSFX(s)
 			if not sfxSpec[id] then return flash(btn, "No data") end
 			toClip(script(), "the SFX script")
 			flash(btn, "Copied!")
-		end, C.sel),
-		copyAct("ID", function() return id end, "the sound id"),
+		end, C.sel, 1, 1),
+		runAct(function()
+			if not sfxSpec[id] then error("no data captured") end
+			runEvents({ sfxSpec[id] }, "SFX " .. (sfxLabel[id] or id))
+		end, 1, 0.9),
 		act("VIEW FULL CODE", function()
 			if not sfxSpec[id] then error("no data captured") end
 			openViewer("SFX - " .. (sfxLabel[id] or id), {
 				{ name = "Script", get = function(cb) cb(script()) end },
 			}, 1)
-		end, C.sel),
-		runAct(function()
-			if not sfxSpec[id] then error("no data captured") end
-			runEvents({ sfxSpec[id] }, "SFX " .. (sfxLabel[id] or id))
-		end),
-		{ color = C.btn, state = function() return excludedSFX[id] and "Unexcl" or "Excl", excludedSFX[id] end,
+		end, C.sel, 1, 2.2),
+		copyAct("ID", function() return id end, "the sound id", 2),
+		{ line = 2, color = C.btn, state = function() return excludedSFX[id] and "Unexcl" or "Excl", excludedSFX[id] end,
 			fn = function()
 				excludedSFX[id] = not excludedSFX[id] or nil
 				refreshAll()
@@ -3010,6 +3803,503 @@ local function hookSound(s, fromAdded)
 	if fromAdded and s.Playing then task.defer(onPlay) end
 end
 
+--// Search tab (every animation in the game) + live preview ------------------------------------
+X.PAGE = 60
+
+X.keyNote = function(id)
+	local list = X.markers[id]
+	if not list or #list == 0 then return "" end
+	local parts, seen = {}, {}
+	for _, k in ipairs(list) do
+		local key = k[1] .. string.format("%.2f", k[2])
+		if not seen[key] and #parts < 12 then
+			seen[key] = true
+			parts[#parts + 1] = string.format("%s@%.2fs", tostring(k[1]), k[2])
+		end
+	end
+	return " | Keyframes: " .. table.concat(parts, ", ")
+end
+
+X.FXOK = {
+	ParticleEmitter = true, Fire = true, Smoke = true, Sparkles = true,
+	PointLight = true, SpotLight = true, SurfaceLight = true, Highlight = true,
+}
+
+-- Guess the effects that belong to an animation that was never seen playing:
+-- everything in the same Tool / Model / folder as its Animation object, plus effects and
+-- sounds in ReplicatedStorage whose name (or parent folder name) matches the animation name.
+function X.relatedFX(e)
+	local out, seen = {}, {}
+	local function consider(d)
+		if #out >= 60 or seen[d] then return end
+		seen[d] = true
+		local cls = d.ClassName
+		if cls == "Sound" then
+			if d.SoundId == "" then return end
+			local ok, ev = pcall(buildSFXEvent, d, nil, 0)
+			if ok and ev then
+				ev.pos = true
+				out[#out + 1] = ev
+			end
+		elseif X.FXOK[cls] then
+			local ok, ev = pcall(buildVFXEvent, d, nil, tonumber(d:GetAttribute("EmitDelay")) or 0)
+			if ok and ev then
+				ev.mount = { cf = CFrame.new() } -- at your character
+				out[#out + 1] = ev
+			end
+		end
+	end
+
+	local roots = {}
+	local inst = e.inst
+	if inst then
+		local c = inst:FindFirstAncestorWhichIsA("Tool") or inst:FindFirstAncestorOfClass("Model")
+		if c then roots[#roots + 1] = c end
+		local p = inst.Parent
+		if p and p.Parent and p.Parent ~= game and p ~= c then roots[#roots + 1] = p end
+	end
+	for _, r in ipairs(roots) do
+		local n = 0
+		for _, d in ipairs(r:GetDescendants()) do
+			n += 1
+			if n > 3000 then break end
+			consider(d)
+		end
+	end
+
+	local full = tostring(e.name or ""):lower():gsub("[^%w]", "")
+	local tokens = {}
+	if #full >= 3 then tokens[1] = full end
+	for w in tostring(e.name or ""):gmatch("%u?%l+") do
+		if #w >= 5 then tokens[#tokens + 1] = w:lower() end
+	end
+	if #tokens > 0 then
+		local rs = game:GetService("ReplicatedStorage")
+		local n = 0
+		for _, d in ipairs(rs:GetDescendants()) do
+			n += 1
+			if n > 40000 then break end
+			if d.ClassName == "Sound" or X.FXOK[d.ClassName] then
+				local hay, p = d.Name:lower(), d.Parent
+				for _ = 1, 3 do
+					if p and p ~= rs then
+						hay = hay .. " " .. p.Name:lower()
+						p = p.Parent
+					end
+				end
+				for _, t in ipairs(tokens) do
+					if hay:find(t, 1, true) then
+						consider(d)
+						break
+					end
+				end
+			end
+		end
+	end
+	return out
+end
+
+function X.prepareFX(e)
+	if fxWindows.related[e.id] then return end
+	local ok, list = pcall(X.relatedFX, e)
+	fxWindows.related[e.id] = (ok and list) or {}
+end
+
+-- play an animation on your own character while recording the FX the game triggers
+function X.capture(id, btn)
+	local char = lp.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local animator = hum and hum:FindFirstChildOfClass("Animator")
+	if not animator then error("no animator on your character") end
+	btn.Text = "Loading..."
+	task.spawn(function()
+		local anim = Instance.new("Animation")
+		anim.AnimationId = id
+		local ok, track = pcall(function() return animator:LoadAnimation(anim) end)
+		local function fail()
+			if btn.Parent then btn.Text = "Fail" end
+			task.delay(1.5, function() if btn.Parent then btn.Text = "Capture" end end)
+		end
+		if not ok or not track then return fail() end
+		ownTracks[track] = true
+		local waited = 0
+		while track.Length == 0 and waited < 4 do waited += RunService.Heartbeat:Wait() end
+		if track.Length == 0 then return fail() end
+		openFXWindow(id, animator, track)
+		track:Play()
+		if btn.Parent then btn.Text = "Recording..." end
+		task.wait(track.Length + FX_POST + 0.6)
+		if btn.Parent then btn.Text = "Done" end
+		task.delay(1.5, function() if btn.Parent then btn.Text = "Capture" end end)
+	end)
+end
+
+function X.searchActions(e)
+	local id = e.id
+	local function frameBtn(text, withFX, w)
+		return act(text, function(btn)
+			local function finish()
+				if withFX then X.prepareFX(e) end
+				local okC, code = pcall(buildAnimCode, id, withFX)
+				if okC then
+					toClip(code, "the frame-by-frame script")
+					btn.Text = "Copied!"
+				else
+					out("Failed: " .. tostring(code))
+					btn.Text = "Fail"
+				end
+				task.delay(1.5, function() if btn.Parent then btn.Text = text end end)
+			end
+			if details[id] then return finish() end
+			btn.Text = "Working..."
+			requestDetail(id, function(ok, res)
+				if not btn.Parent then return end
+				if ok then
+					finish()
+				else
+					out("Frame-by-frame failed: " .. tostring(res))
+					btn.Text = "Fail"
+					task.delay(1.5, function() if btn.Parent then btn.Text = text end end)
+				end
+			end, function(t) if btn.Parent then btn.Text = t:sub(1, 16) end end)
+		end, C.sel, 1, w)
+	end
+	return {
+		frameBtn("Copy", false, 1),
+		frameBtn("Full+FX", true, 1.3),
+		act("Preview", function() X.pvOpen(id, e) end, C.green, 1, 1),
+		act("VIEW FULL CODE", function()
+			X.prepareFX(e)
+			openAnimViewer(id)
+		end, C.sel, 1, 2.2),
+		act("Capture", function(btn) X.capture(id, btn) end, nil, 2),
+		runAct(function() playAnim(id) end, 2, 1),
+		copyAct("Code", function() return simpleCode(id) end, "the AnimationId script", 2),
+		copyAct("ID", function() return id end, "the AnimationId", 2),
+	}
+end
+
+function X.addRow(e)
+	local id = e.id
+	animLabel[id] = animLabel[id] or e.name
+	animInfo[id] = animInfo[id] or { priority = "Action", looped = false, speed = 1 }
+	local detail = id .. "\n" .. e.path
+	if #e.alt > 0 then detail = detail .. "\nAlso named: " .. table.concat(e.alt, ", ") end
+	local ent = addEntry("Search", id, e.name, detail, id, X.searchActions(e), C.anim)
+	if ent then
+		entriesById[id] = entriesById[id] or {}
+		table.insert(entriesById[id], ent)
+		refreshExtra(id)
+	end
+end
+
+function X.more()
+	local list = lists.Search
+	local old = list:FindFirstChild("MoreBtn")
+	if old then old:Destroy() end
+	local to = math.min(X.shown + X.PAGE, #X.matches)
+	for i = X.shown + 1, to do X.addRow(X.matches[i]) end
+	X.shown = to
+	X.sInfo.Text = string.format("%d of %d animations match - showing %d", #X.matches, #X.db, X.shown)
+	if X.shown < #X.matches then
+		local b = newButton(list, string.format("Show more (%d left)", #X.matches - X.shown), C.btn)
+		b.Name = "MoreBtn"
+		b.Size = UDim2.new(1, -6, 0, 34)
+		b.LayoutOrder = 1000000
+		b.MouseButton1Click:Connect(X.more)
+	end
+end
+
+function X.render()
+	if not X.db then
+		X.sInfo.Text = "Press Scan game to list every animation in this game."
+		return
+	end
+	local tokens = {}
+	for w in X.sBox.Text:lower():gmatch("%S+") do tokens[#tokens + 1] = w end
+	local matches = {}
+	for _, e in ipairs(X.db) do
+		local ok = true
+		for _, t in ipairs(tokens) do
+			if not e.hay:find(t, 1, true) then
+				ok = false
+				break
+			end
+		end
+		if ok then matches[#matches + 1] = e end
+	end
+	X.matches, X.shown = matches, 0
+	clearKind("Search")
+	X.more()
+end
+
+function X.scan()
+	if X.scanning then return end
+	X.scanning = true
+	X.sScan.Text = "Scanning..."
+	X.sInfo.Text = "Scanning the whole game for animations..."
+	local db, byId, count = {}, {}, 0
+	local function add(id, name, path, inst)
+		if type(id) ~= "string" or id == "" or not id:find("%d") or id == "rbxassetid://0" then return end
+		local e = byId[id]
+		if e then
+			if name ~= e.name and #e.alt < 8 and not table.find(e.alt, name) then e.alt[#e.alt + 1] = name end
+			if not e.inst and inst then e.inst = inst end
+			return
+		end
+		e = { id = id, name = (name ~= "" and name) or "(unnamed)", path = path or "?", inst = inst, alt = {} }
+		byId[id] = e
+		db[#db + 1] = e
+	end
+	local function visit(list)
+		for _, d in ipairs(list) do
+			count += 1
+			if count % 2000 == 0 then task.wait() end
+			if d.ClassName == "Animation" then
+				pcall(function() add(d.AnimationId, d.Name, d:GetFullName(), d) end)
+			end
+		end
+	end
+	local ok, err = pcall(function()
+		local done = false
+		if getinstances then done = pcall(function() visit(getinstances()) end) end
+		if not done then
+			visit(game:GetDescendants())
+			if getnilinstances then
+				for _, n in ipairs(getnilinstances()) do
+					if n.ClassName == "Animation" then add(n.AnimationId, n.Name, "(nil) " .. n.Name, n) end
+					pcall(function() visit(n:GetDescendants()) end)
+				end
+			end
+		end
+		for id, label in pairs(animLabel) do add(id, label, "(seen playing in this session)", nil) end
+		for _, e in ipairs(db) do
+			e.hay = (e.name .. " " .. e.path .. " " .. e.id .. " " .. table.concat(e.alt, " ")):lower()
+		end
+		table.sort(db, function(a, b) return a.name:lower() < b.name:lower() end)
+	end)
+	X.scanning = false
+	if X.sScan.Parent then X.sScan.Text = "Rescan" end
+	if not ok then
+		X.sInfo.Text = "Scan failed: " .. tostring(err)
+		return
+	end
+	X.db = db
+	X.render()
+end
+
+--// Live preview (clone of your character in front of you) ---------------------------------------
+X.speeds = { 0.25, 0.5, 1, 1.5, 2 }
+
+function X.pvStatus(text)
+	local P = X.pv
+	if P and P.status and P.status.Parent then P.status.Text = text end
+end
+
+function X.pvWatch(on, P)
+	P = P or X.pv
+	local cam = workspace.CurrentCamera
+	if not P or not cam then return end
+	if on then
+		P.oldSubject = cam.CameraSubject
+		cam.CameraSubject = P.hum
+		P.watching = true
+	else
+		local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
+		cam.CameraSubject = (P.oldSubject and P.oldSubject.Parent) and P.oldSubject or hum
+		P.watching = false
+	end
+end
+
+function X.pvPlace()
+	local P, root = X.pv, getRoot()
+	if not P or not root or not P.rig.Parent then return end
+	P.rig:PivotTo(root.CFrame * CFrame.new(0, 0, -7) * CFrame.Angles(0, math.pi, 0))
+end
+
+function X.pvClose()
+	local P = X.pv
+	X.pv = nil
+	if not P then return end
+	P.token += 1
+	pcall(function() if P.track then P.track:Stop(0) end end)
+	pcall(function() if P.watching then X.pvWatch(false, P) end end)
+	pcall(function() P.rig:Destroy() end)
+	pcall(function() P.win.destroy() end)
+end
+
+-- run FX events on any model (the preview rig) instead of your own character
+function X.runOn(events, title, rig)
+	if not loadstring then error("loadstring is not available in this executor") end
+	local code = genStandaloneFX(events, title)
+	code = code:gsub("local lp = Players%.LocalPlayer", "local lp = { Character = (getgenv and getgenv() or _G).__AVL_PreviewRig }", 1)
+	local fn, err = loadstring(code)
+	if not fn then error(err) end
+	local env = (getgenv and getgenv()) or _G
+	env.__AVL_PreviewRig = rig
+	fn()
+end
+
+function X.pvPlay()
+	local P = X.pv
+	if not P or not P.rig.Parent then return end
+	P.token += 1
+	local my = P.token
+	task.spawn(function()
+		pcall(function() if P.track then P.track:Stop(0) end end)
+		local anim = Instance.new("Animation")
+		anim.AnimationId = P.id
+		local ok, track = pcall(function() return P.animator:LoadAnimation(anim) end)
+		if not ok or not track then return X.pvStatus("Could not load this animation on the preview rig.") end
+		ownTracks[track] = true
+		P.track = track
+		local waited = 0
+		while track.Length == 0 and waited < 4 do waited += RunService.Heartbeat:Wait() end
+		if my ~= P.token then return end
+		if track.Length == 0 then return X.pvStatus("Animation did not load (not allowed / invalid id).") end
+		track.Looped = P.loop
+		track:Play(0.1, 1, P.speed)
+		local len = track.Length / P.speed
+		local list = P.fx and fxWindows.liveFor(P.id) or nil
+		X.pvStatus(string.format("%s\n%.2fs at %sx | loop %s | %s", P.id, len, tostring(P.speed), P.loop and "on" or "off",
+			P.fx and (list and (#list .. " FX events") or "no FX recorded yet (play it in-game or press Capture)") or "FX off"))
+		local function fxOnce()
+			if not list or #list == 0 then return end
+			local scaled = {}
+			for _, e in ipairs(list) do
+				local c = table.clone(e)
+				c.t = (e.t or 0) / P.speed
+				scaled[#scaled + 1] = c
+			end
+			local okF, errF = pcall(X.runOn, scaled, "Preview", P.rig)
+			if not okF then X.pvStatus("FX failed: " .. tostring(errF)) end
+		end
+		fxOnce()
+		while P.loop and my == P.token and P.rig.Parent do
+			task.wait(math.max(len, 0.3))
+			if my ~= P.token or not P.loop then break end
+			fxOnce()
+		end
+	end)
+end
+
+function X.pvOpen(id, e)
+	if e and (e.search or X.guess) then X.prepareFX(e) end
+	local P = X.pv
+	if P and P.rig.Parent then
+		P.id = id
+		X.pvPlay()
+		return
+	end
+	X.pvClose()
+	local char, root = lp.Character, getRoot()
+	if not (char and root) then error("no character") end
+	local wasArch = char.Archivable
+	char.Archivable = true
+	local rig = char:Clone()
+	char.Archivable = wasArch
+	if not rig then error("could not clone your character") end
+	for _, d in ipairs(rig:GetDescendants()) do
+		if d:IsA("LuaSourceContainer") then
+			d:Destroy()
+		else
+			if d:IsA("BasePart") then
+				d.CanCollide = false
+				d.CanQuery = false
+				d.CanTouch = false
+			end
+			if d:IsA("Animator") or d:IsA("Sound") or VFX_CLASSES[d.ClassName] then d:SetAttribute("_LoggerClone", true) end
+		end
+	end
+	local hum = rig:FindFirstChildOfClass("Humanoid")
+	local rroot = rig:FindFirstChild("HumanoidRootPart")
+	if not hum or not rroot then
+		rig:Destroy()
+		error("clone has no humanoid")
+	end
+	rroot.Anchored = true -- only the root: the limbs must stay free to animate
+	pcall(function() hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None end)
+	local animator = hum:FindFirstChildOfClass("Animator")
+	if not animator then
+		animator = Instance.new("Animator")
+		animator:SetAttribute("_LoggerClone", true)
+		animator.Parent = hum
+	end
+	rig:SetAttribute("_LoggerClone", true)
+	rig.Name = "AnimPreview"
+	rig.Parent = workspace
+
+	local win = createWindow({
+		title = "Live Preview",
+		size = Vector2.new(380, 230),
+		pos = UDim2.new(1, -400, 0, 70),
+		minSize = Vector2.new(330, 200),
+		miniText = "PV",
+		onClose = function() X.pvClose() end,
+	})
+	P = { id = id, rig = rig, hum = hum, animator = animator, loop = false, speed = 1, fx = true, token = 0, win = win }
+	X.pv = P
+
+	local grid = Instance.new("Frame")
+	grid.Size = UDim2.new(1, -12, 0, 96)
+	grid.Position = UDim2.new(0, 6, 0, 6)
+	grid.BackgroundTransparency = 1
+	grid.Parent = win.content
+	local gl = Instance.new("UIGridLayout")
+	gl.CellSize = UDim2.new(1 / 3, -6, 0, 42)
+	gl.CellPadding = UDim2.new(0, 6, 0, 8)
+	gl.SortOrder = Enum.SortOrder.LayoutOrder
+	gl.Parent = grid
+	local function mk(text, order, color, fn)
+		local b = newButton(grid, text, color or C.btn)
+		b.LayoutOrder = order
+		b.MouseButton1Click:Connect(function() fn(b) end)
+		return b
+	end
+	mk("Replay", 1, C.sel, function() X.pvPlay() end)
+	mk("Loop: Off", 2, C.btn, function(b)
+		P.loop = not P.loop
+		b.Text = P.loop and "Loop: On" or "Loop: Off"
+		paint(b, P.loop and C.sel or C.btn)
+		X.pvPlay()
+	end)
+	mk("Speed: 1x", 3, C.btn, function(b)
+		local i = table.find(X.speeds, P.speed) or 3
+		P.speed = X.speeds[i % #X.speeds + 1]
+		b.Text = "Speed: " .. tostring(P.speed) .. "x"
+		X.pvPlay()
+	end)
+	mk("FX: On", 4, C.sel, function(b)
+		P.fx = not P.fx
+		b.Text = P.fx and "FX: On" or "FX: Off"
+		paint(b, P.fx and C.sel or C.btn)
+		X.pvPlay()
+	end)
+	mk("Move to me", 5, C.btn, function() X.pvPlace() end)
+	mk("Watch: Off", 6, C.btn, function(b)
+		X.pvWatch(not P.watching, P)
+		b.Text = P.watching and "Watch: On" or "Watch: Off"
+		paint(b, P.watching and C.sel or C.btn)
+	end)
+
+	local status = Instance.new("TextLabel")
+	status.Position = UDim2.new(0, 8, 0, 108)
+	status.Size = UDim2.new(1, -16, 1, -114)
+	status.BackgroundTransparency = 1
+	status.TextColor3 = C.sub
+	status.Font = Th.font
+	status.TextSize = 14
+	status.TextWrapped = true
+	status.TextXAlignment = Enum.TextXAlignment.Left
+	status.TextYAlignment = Enum.TextYAlignment.Top
+	status.Text = id
+	status.Parent = win.content
+	P.status = status
+
+	X.pvPlace()
+	X.pvPlay()
+end
+
 --// Saving settings -------------------------------------------------------------------------------
 local lastSavedJson
 saveSettings = function()
@@ -3021,6 +4311,8 @@ saveSettings = function()
 	end
 	local ok, json = pcall(function()
 		return HttpService:JSONEncode({
+			version = 2, theme = Th.cur.name, filter = X.filter, compact = X.compact, deepHook = X.deep,
+			thorough = X.thorough, guessFX = X.guess, fxPre = X.pre,
 			quality = QUALITY, ownOnly = ownOnly, uniqueOnly = uniqueOnly, detailedMode = detailedMode,
 			tab = lastLogTab,
 			excluded = labelsFor(excluded, animLabel),
@@ -3042,6 +4334,14 @@ task.spawn(function()
 	end
 end)
 
+Run.cleanup = function()
+	Run.alive = false
+	pcall(X.pvClose)
+	pcall(saveSettings)
+	for _, c in ipairs(Run.conns) do pcall(function() c:Disconnect() end) end
+	pcall(function() gui:Destroy() end)
+end
+
 --// Hook the world ---------------------------------------------------------------------------------
 for _, d in ipairs(workspace:GetDescendants()) do
 	if d:IsA("Animator") and not d:GetAttribute("_LoggerClone") then
@@ -3054,7 +4354,8 @@ for _, d in ipairs(SoundService:GetDescendants()) do
 	if d:IsA("Sound") then hookSound(d, false) end
 end
 
-workspace.DescendantAdded:Connect(function(d)
+table.insert(Run.conns, workspace.DescendantAdded:Connect(function(d)
+	if not Run.alive then return end
 	if d:IsA("Animator") then
 		if not d:GetAttribute("_LoggerClone") then watchAnimator(d) end
 	elseif d:IsA("Sound") then
@@ -3062,19 +4363,60 @@ workspace.DescendantAdded:Connect(function(d)
 	elseif VFX_CLASSES[d.ClassName] then
 		task.defer(watchVFX, d)
 	end
-end)
-SoundService.DescendantAdded:Connect(function(d)
-	if d:IsA("Sound") then hookSound(d, true) end
-end)
+end))
+table.insert(Run.conns, SoundService.DescendantAdded:Connect(function(d)
+	if Run.alive and d:IsA("Sound") then hookSound(d, true) end
+end))
 
--- Existing emitters: only log when they switch on / get re-enabled
+-- Existing effects: log when they switch on / get re-enabled
 for _, d in ipairs(workspace:GetDescendants()) do
-	if d:IsA("ParticleEmitter") then
-		d:GetPropertyChangedSignal("Enabled"):Connect(function()
-			if d.Enabled and not d:GetAttribute("_LoggerClone") and not d:GetAttribute("_Replay") then
-				logVFX(d)
-			end
+	if VFX_CLASSES[d.ClassName] then
+		local okE = pcall(function() return d.Enabled end)
+		if okE then
+			d:GetPropertyChangedSignal("Enabled"):Connect(function()
+				if Run.alive and d.Enabled and not d:GetAttribute("_LoggerClone") and not d:GetAttribute("_Replay") then
+					logVFX(d)
+				end
+			end)
+		end
+	end
+end
+
+-- Deep hook: catches ParticleEmitter:Emit() and Sound:Play() calls (no property ever changes for
+-- those, so nothing else can see them). Only works when the executor has hookmetamethod.
+-- It is installed once; running the script again just swaps the handler.
+do
+	local env = (getgenv and getgenv()) or _G
+	local H = env.__AVLHook
+	if not H and X.deep and hookmetamethod and getnamecallmethod and newcclosure then
+		H = {}
+		local okH = pcall(function()
+			local old
+			old = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+				local m = getnamecallmethod()
+				if (m == "Emit" or m == "Play") and H.fn and typeof(self) == "Instance"
+					and not (checkcaller and checkcaller()) then
+					task.defer(H.fn, self, m, os.clock(), (...))
+				end
+				if setnamecallmethod then setnamecallmethod(m) end
+				return old(self, ...)
+			end))
 		end)
+		if okH then env.__AVLHook = H else H = nil end
+	end
+	if H then
+		H.fn = function(inst, m, at, a1)
+			if not Run.alive or not X.deep then return end
+			pcall(function()
+				if inst:GetAttribute("_Replay") or inst:GetAttribute("_LoggerClone") then return end
+				local cls = inst.ClassName
+				if m == "Emit" and cls == "ParticleEmitter" then
+					logVFX(inst, { emit = math.max(tonumber(a1) or 1, 1), enabled = false }, at)
+				elseif m == "Play" and cls == "Sound" then
+					logSFX(inst, at)
+				end
+			end)
+		end
 	end
 end
 
