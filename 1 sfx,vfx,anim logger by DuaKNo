@@ -40,6 +40,7 @@ local lp = Players.LocalPlayer
 local Run = { alive = true, conns = {} } -- Run.cleanup is assigned once the GUI exists
 local X = { -- extra state + helpers in ONE table (Luau limits a script to 200 locals)
 	filter = "", compact = false, deep = true, thorough = false, guess = false, pre = 3,
+	camSegs = {}, objOn = true, objSeen = setmetatable({}, { __mode = "k" }),
 	markers = {}, fxEdit = {}, lens = {}, fastAnim = setmetatable({}, { __mode = "k" }), lastRow = setmetatable({}, { __mode = "k" }), compactButtons = {}, sizeIdx = 2,
 }
 do
@@ -81,7 +82,7 @@ do
 	sc.Parent = root
 	pcall(function()
 		local vp = workspace.CurrentCamera.ViewportSize
-		sc.Scale = math.clamp(math.min((vp.X - 30) / 492, (vp.Y - 30) / 281), 0.5, 1)
+		sc.Scale = math.clamp(math.min((vp.X - 30) / 492, (vp.Y - 30) / 281), 0.4, 0.62)
 	end)
 
 	-- lighter diagonal band on the far right (like Dex++), clipped inside the panel
@@ -316,6 +317,7 @@ if loaded then
 	if type(loaded.deepHook) == "boolean" then X.deep = loaded.deepHook end
 	if type(loaded.thorough) == "boolean" then X.thorough = loaded.thorough end
 	if type(loaded.guessFX) == "boolean" then X.guess = loaded.guessFX end
+	if type(loaded.objOn) == "boolean" then X.objOn = loaded.objOn end
 	if tonumber(loaded.fxPre) then X.pre = math.clamp(tonumber(loaded.fxPre), 1, 10) end
 end
 
@@ -636,6 +638,317 @@ function K.buildSFXEvent(s, _model, t)
 	return ev
 end
 
+
+--// Spawned objects (swords, dummies, parts...) and cutscene cameras ----------------------------------
+K.OBJ_PROPS = { "Size", "Color", "Material", "Transparency", "Reflectance" }
+K.OBJ_EXTRA = { Part = { "Shape" }, MeshPart = { "MeshId", "TextureID" } }
+K.OBJ_KIDS = {
+	SpecialMesh = { "MeshId", "TextureId", "Scale", "Offset", "MeshType", "VertexColor" },
+	Decal = { "Texture", "Face", "Transparency", "Color3" },
+	Texture = { "Texture", "Face", "Transparency", "Color3", "StudsPerTileU", "StudsPerTileV" },
+	SurfaceAppearance = { "ColorMap", "NormalMap", "MetalnessMap", "RoughnessMap", "AlphaMode" },
+	PointLight = { "Brightness", "Range", "Color", "Enabled" },
+	SpotLight = { "Brightness", "Range", "Color", "Angle", "Enabled" },
+}
+K.OBJ_CLASS = { Part = true, WedgePart = true, CornerWedgePart = true, TrussPart = true, MeshPart = true }
+
+function K.objPivot(inst)
+	if inst:IsA("BasePart") then return inst.CFrame end
+	local h = inst:FindFirstChild("Handle")
+	if h and h:IsA("BasePart") then return h.CFrame end
+	local ok, cf = pcall(inst.GetPivot, inst)
+	if ok and cf then return cf end
+	local p = inst:FindFirstChildWhichIsA("BasePart", true)
+	return p and p.CFrame
+end
+
+-- a tool / accessory held or worn by the character: which body part is it attached to?
+function K.objMount(inst, model, pivot)
+	if not (model and inst:IsDescendantOf(model)) then return nil end
+	local handle = inst:IsA("BasePart") and inst or inst:FindFirstChild("Handle") or inst:FindFirstChildWhichIsA("BasePart", true)
+	if not handle then return nil end
+	local ok, joints = pcall(handle.GetJoints, handle)
+	if not ok then return nil end
+	for _, j in ipairs(joints) do
+		local okJ, other = pcall(function() return j.Part0 == handle and j.Part1 or j.Part0 end)
+		if okJ and other and other ~= handle and other:IsA("BasePart") and other:IsDescendantOf(model) and not other:IsDescendantOf(inst) then
+			return { part = other.Name, cf = other.CFrame:ToObjectSpace(pivot) }
+		end
+	end
+	return nil
+end
+
+function K.buildObjEvent(inst, model, t)
+	local root = (model and model:FindFirstChild("HumanoidRootPart")) or K.getRoot()
+	if not root then return nil end
+	local pivot = K.objPivot(inst)
+	if not pivot then return nil end
+	local list = {}
+	if inst:IsA("BasePart") then
+		list[1] = inst
+	else
+		for _, d in ipairs(inst:GetDescendants()) do
+			if d:IsA("BasePart") and #list < 120 then list[#list + 1] = d end
+		end
+	end
+	if #list == 0 then return nil end
+	local parts = {}
+	for _, d in ipairs(list) do
+		local cls = K.OBJ_CLASS[d.ClassName] and d.ClassName or "Part"
+		local names = table.clone(K.OBJ_PROPS)
+		for _, n in ipairs(K.OBJ_EXTRA[cls] or {}) do names[#names + 1] = n end
+		local kids = {}
+		for _, k in ipairs(d:GetChildren()) do
+			local kp = K.OBJ_KIDS[k.ClassName]
+			if kp and #kids < 6 then kids[#kids + 1] = { cls = k.ClassName, props = K.readProps(k, kp) } end
+		end
+		parts[#parts + 1] = { cls = cls, name = d.Name, rel = pivot:ToObjectSpace(d.CFrame), props = K.readProps(d, names), kids = kids }
+	end
+	return {
+		kind = "obj", class = inst.ClassName, name = inst.Name, t = math.max(t or 0, 0), props = {},
+		spec = { parts = parts }, rel = root.CFrame:ToObjectSpace(pivot), _root0 = root.CFrame,
+		dummy = inst:IsA("Model") and inst:FindFirstChildWhichIsA("Humanoid", true) ~= nil,
+		mount = K.objMount(inst, model, pivot),
+	}
+end
+
+function K.specStr(sp)
+	local L = { "{ parts = {" }
+	for _, d in ipairs(sp.parts) do
+		local ps, ks = {}, {}
+		for _, kv in ipairs(d.props) do ps[#ps + 1] = string.format("{%q, %s}", kv[1], kv[2]) end
+		for _, k in ipairs(d.kids) do
+			local kp = {}
+			for _, kv in ipairs(k.props) do kp[#kp + 1] = string.format("{%q, %s}", kv[1], kv[2]) end
+			ks[#ks + 1] = string.format("{ cls = %q, props = { %s } }", k.cls, table.concat(kp, ", "))
+		end
+		L[#L + 1] = string.format("{ cls = %q, name = %q, rel = %s, props = { %s }, kids = { %s } },", d.cls, d.name, K.cfStr(d.rel), table.concat(ps, ", "), table.concat(ks, ", "))
+	end
+	L[#L + 1] = "} }"
+	return table.concat(L, "\n")
+end
+
+-- a cutscene camera is only worth keeping when it really moves / is far away (not a normal follow camera)
+function K.camKeep(e)
+	local sm = e.cam
+	if not sm or #sm < 2 then return false end
+	local p0, fov0 = sm[1][2].Position, sm[1][3]
+	local mv, df, far = 0, 0, 0
+	for _, f in ipairs(sm) do
+		mv = math.max(mv, (f[2].Position - p0).Magnitude)
+		df = math.max(df, math.abs(f[3] - fov0))
+		far = math.max(far, f[2].Position.Magnitude)
+	end
+	return mv > 1.5 or df > 3 or far > 20
+end
+
+--// GET tool: the animation as a Tool you can click ---------------------------------------------------
+function K.findAnimContext(id) -- the modules / models that live next to this animation in the game
+	local nid = tostring(id):match("%d+")
+	local res = { modules = {}, models = {}, scripts = {} }
+	if not nid then return res end
+	local roots = { game:GetService("ReplicatedStorage"), game:GetService("StarterPack"), game:GetService("StarterPlayer"), game:GetService("Lighting"), workspace }
+	local bp = lp:FindFirstChildOfClass("Backpack")
+	if bp then table.insert(roots, 1, bp) end
+	if lp.Character then table.insert(roots, 1, lp.Character) end
+	local anim, n = nil, 0
+	for _, root in ipairs(roots) do
+		for _, d in ipairs(root:GetDescendants()) do
+			n += 1
+			if n % 3000 == 0 then task.wait() end
+			if d:IsA("Animation") and tostring(d.AnimationId):find(nid, 1, true) then
+				anim = d
+				break
+			end
+		end
+		if anim then break end
+	end
+	if not anim then return res end
+	local top = anim:FindFirstAncestorOfClass("Tool")
+	if not top then
+		top = anim.Parent
+		for _ = 1, 2 do
+			local p = top and top.Parent
+			if p and p ~= game and p.Parent ~= game then top = p else break end
+		end
+	end
+	res.anim, res.top = anim, top
+	if not top then return res end
+	local list = top:GetDescendants()
+	table.insert(list, 1, top)
+	for i, d in ipairs(list) do
+		if i % 2000 == 0 then task.wait() end
+		if d:IsA("ModuleScript") then
+			if #res.modules < 12 then
+				local src
+				if decompile then
+					local ok, text = pcall(decompile, d)
+					if ok and type(text) == "string" then src = text:sub(1, 60000) end
+				end
+				res.modules[#res.modules + 1] = { path = d:GetFullName(), class = d.ClassName, source = src }
+			end
+		elseif d:IsA("Script") or d:IsA("LocalScript") then
+			if #res.scripts < 12 then res.scripts[#res.scripts + 1] = d:GetFullName() end
+		elseif (d:IsA("Model") or d:IsA("Tool") or d:IsA("Accoutrement")) and #res.models < 4 then
+			local ok, ev = pcall(K.buildObjEvent, d, nil, 0)
+			if ok and ev and ev.spec then res.models[#res.models + 1] = { name = d.Name, path = d:GetFullName(), spec = ev.spec } end
+		end
+	end
+	return res
+end
+
+function K.longStr(str) -- a Lua long string that cannot be broken by the text inside it
+	local n = 0
+	while str:find("]" .. string.rep("=", n) .. "]", 1, true) do n += 1 end
+	local eq = string.rep("=", n)
+	return "[" .. eq .. "[\n" .. str .. "\n]" .. eq .. "]"
+end
+
+function K.buildToolCode(id, animCode, ctx, label)
+	local name = tostring(label or "Animation"):gsub("[^%w _%-]", ""):sub(1, 28)
+	if name == "" then name = "Animation" end
+	local L = {}
+	local function add(t) L[#L + 1] = t end
+	add("-- TOOL generated by the FX / Animation Logger")
+	add("-- Equip / hold the tool and click (or tap) to play: " .. name)
+	add("-- Models and modules found next to the animation are listed in MODELS and MODULES below.")
+	if ctx and ctx.top then add("-- Found in: " .. ctx.top:GetFullName()) end
+	for _, sp in ipairs(ctx and ctx.scripts or {}) do add("-- script: " .. sp) end
+	add("")
+	add("local NAME = " .. string.format("%q", name))
+	add("local ANIM = " .. K.longStr(animCode))
+	add("")
+	add("local MODELS = {")
+	for _, m in ipairs(ctx and ctx.models or {}) do
+		add(string.format("\t{ name = %q, path = %q, spec = %s },", m.name, m.path, (K.specStr(m.spec):gsub("\n", "\n\t"))))
+	end
+	add("}")
+	add("local MODULES = {")
+	for _, m in ipairs(ctx and ctx.modules or {}) do
+		add(string.format("\t{ path = %q, class = %q, source = %s },", m.path, m.class, m.source and K.longStr(m.source) or "nil"))
+	end
+	add("}")
+	add("local GENV = getgenv and getgenv() or _G")
+	add("GENV.AVL_ToolModules = MODULES")
+	add([==[
+
+local Players = game:GetService("Players")
+local lp = Players.LocalPlayer
+
+local function mkPart(d)
+	local ok, o = pcall(Instance.new, d.cls)
+	local p = (ok and o and o:IsA("BasePart")) and o or Instance.new("Part")
+	for _, kv in ipairs(d.props) do pcall(function() p[kv[1]] = kv[2] end) end
+	p.Name = d.name
+	p.Anchored = false
+	p.CanCollide = false
+	p.CanQuery = false
+	p.CanTouch = false
+	p.Massless = true
+	for _, k in ipairs(d.kids or {}) do
+		local okK, o2 = pcall(Instance.new, k.cls)
+		if okK and o2 then
+			for _, kv in ipairs(k.props) do pcall(function() o2[kv[1]] = kv[2] end) end
+			o2.Parent = p
+		end
+	end
+	return p
+end
+
+-- the first model found next to the animation becomes what you hold
+local function buildHandle(tool)
+	local m = MODELS[1]
+	if not (m and m.spec and m.spec.parts[1]) then return false end
+	local made, first = {}, nil
+	for i, d in ipairs(m.spec.parts) do
+		local ok, p = pcall(mkPart, d)
+		if ok and p then
+			made[i] = p
+			first = first or i
+		end
+	end
+	if not first then return false end
+	local h = made[first]
+	h.Name = "Handle"
+	h.Parent = tool
+	local base = m.spec.parts[first].rel
+	for i, p in pairs(made) do
+		if p ~= h then
+			p.CFrame = h.CFrame * (base:Inverse() * m.spec.parts[i].rel)
+			local w = Instance.new("WeldConstraint")
+			w.Part0 = h
+			w.Part1 = p
+			w.Parent = p
+			p.Parent = tool
+		end
+	end
+	return true
+end
+
+local last = 0
+local function onActivated()
+	if os.clock() - last < 0.25 then return end
+	last = os.clock()
+	local loader = loadstring or load
+	local fn, err = loader(ANIM)
+	if not fn then return warn("[tool] " .. tostring(err)) end
+	task.spawn(function()
+		local ok, e = pcall(fn)
+		if not ok then warn("[tool] " .. tostring(e)) end
+	end)
+end
+
+local function giveTool()
+	local backpack = lp:FindFirstChildOfClass("Backpack") or lp:WaitForChild("Backpack", 5)
+	if not backpack then return end
+	local function clean(c)
+		for _, t in ipairs(c:GetChildren()) do
+			if t:IsA("Tool") and t:GetAttribute("_AVLTool") == NAME then t:Destroy() end
+		end
+	end
+	clean(backpack)
+	if lp.Character then clean(lp.Character) end
+	local tool = Instance.new("Tool")
+	tool.Name = NAME
+	tool.CanBeDropped = false
+	tool.ToolTip = "Plays: " .. NAME
+	tool:SetAttribute("_AVLTool", NAME)
+	tool.RequiresHandle = false
+	if buildHandle(tool) then tool.RequiresHandle = true end
+	tool.Activated:Connect(onActivated)
+	tool.Parent = backpack
+end
+
+local G = getgenv and getgenv() or _G
+if G.__AVLToolConn then pcall(function() G.__AVLToolConn:Disconnect() end) end
+giveTool()
+G.__AVLToolConn = lp.CharacterAdded:Connect(function()
+	task.wait(1)
+	giveTool()
+end)
+]==])
+	return table.concat(L, "\n")
+end
+
+-- search categories: movesets, attacks, hits, block, movement, emotes
+function K.animCat(e)
+	local nm = tostring(e.name or ""):lower()
+	local hp = nm .. " " .. tostring(e.path or ""):lower()
+	local function has(h, list)
+		for _, w in ipairs(list) do
+			if h:find(w, 1, true) then return true end
+		end
+		return false
+	end
+	if has(nm, { "hit", "hurt", "damage", "stun", "knock", "ragdoll", "flinch", "getup", "recoil", "impact", "pain", "stagger" }) then return "Hits" end
+	if has(nm, { "block", "parry", "guard", "deflect", "defend" }) then return "Block" end
+	if has(nm, { "emote", "dance", "wave", "laugh", "cheer", "point", "salute", "taunt", "bow", "clap" }) then return "Emotes" end
+	if has(hp, { "moveset", "skill", "abilit", "special", "ultimate", "spell", "cast", "technique", "finisher", "awaken", "stance", "charge", "beam", "blast", "move1", "move2", "move3", "move4", "move5", "move 1", "move 2", "move 3", "move 4" }) then return "Movesets" end
+	if has(nm, { "m1", "m2", "punch", "slash", "swing", "attack", "combo", "kick", "strike", "uppercut", "stab", "shoot", "throw", "light", "heavy" }) then return "Attacks" end
+	if has(nm, { "walk", "run", "idle", "jump", "fall", "climb", "swim", "sprint", "dash", "slide", "crouch", "roll", "dodge", "land", "sit", "fly" }) then return "Movement" end
+	return "Other"
+end
+
 --// Code generation -------------------------------------------------------------
 -- Simple code: plays the original animation by id in any game
 function K.simpleCode(id)
@@ -660,6 +973,7 @@ end
 local FX_RUNTIME = [==[
 local Debris = game:GetService("Debris")
 local SoundService = game:GetService("SoundService")
+local RunService = game:GetService("RunService")
 local fxChar = lp.Character or lp.CharacterAdded:Wait()
 local fxRoot = fxChar:WaitForChild("HumanoidRootPart")
 
@@ -691,7 +1005,119 @@ local function setProps(inst, props)
 	end
 end
 
+local function mkPart(d)
+	local ok, o = pcall(Instance.new, d.cls)
+	local p = (ok and o and o:IsA("BasePart")) and o or Instance.new("Part")
+	for _, kv in ipairs(d.props) do
+		pcall(function() p[kv[1]] = kv[2] end)
+	end
+	p.Name = d.name
+	p.Anchored = true
+	p.CanCollide = false
+	p.CanQuery = false
+	p.CanTouch = false
+	p.Massless = true
+	for _, k in ipairs(d.kids or {}) do
+		local okK, o2 = pcall(Instance.new, k.cls)
+		if okK and o2 then
+			for _, kv in ipairs(k.props) do
+				pcall(function() o2[kv[1]] = kv[2] end)
+			end
+			o2.Parent = p
+		end
+	end
+	return p
+end
+
+-- a spawned object (sword, dummy, parts...) rebuilt from its parts
+local function playObj(e)
+	local holder = Instance.new("Model")
+	holder:SetAttribute("_Replay", true)
+	holder.Name = e.name or "Spawned"
+	local made = {}
+	for i, d in ipairs(e.spec.parts) do
+		local ok, p = pcall(mkPart, d)
+		if ok and p then
+			made[i] = p
+			p.Parent = holder
+		end
+	end
+	if next(made) == nil then
+		holder:Destroy()
+		return
+	end
+	local attached = e.mount and e.mount.part and fxChar:FindFirstChild(e.mount.part, true)
+	local pivotCF
+	if attached and attached:IsA("BasePart") then
+		pivotCF = attached.CFrame * e.mount.cf
+	else
+		attached = nil
+		pivotCF = fxRoot.CFrame * (e.rel or CFrame.new())
+	end
+	for i, d in ipairs(e.spec.parts) do
+		if made[i] then made[i].CFrame = pivotCF * d.rel end
+	end
+	holder.Parent = workspace
+	local life = (e.dur or 2.5)
+	if attached then -- held / worn: follows the animation
+		for _, p in pairs(made) do
+			p.Anchored = false
+			local w = Instance.new("WeldConstraint")
+			w.Part0 = attached
+			w.Part1 = p
+			w.Parent = p
+		end
+	elseif e.path and #e.path >= 2 then -- flies / moves on its own
+		local root0 = fxRoot.CFrame
+		task.spawn(function()
+			local t0 = os.clock()
+			local path = e.path
+			local i = 1
+			while holder.Parent and os.clock() - t0 < life do
+				local t = os.clock() - t0
+				while i < #path - 1 and path[i + 1][1] < t do i += 1 end
+				local a, b = path[i], path[i + 1]
+				local al = math.clamp((t - a[1]) / math.max(b[1] - a[1], 1e-4), 0, 1)
+				local pc = root0 * a[2]:Lerp(b[2], al)
+				for k, d in ipairs(e.spec.parts) do
+					if made[k] then made[k].CFrame = pc * d.rel end
+				end
+				RunService.Heartbeat:Wait()
+			end
+		end)
+	end
+	Debris:AddItem(holder, life + 0.3)
+end
+
+-- cutscene camera: plays the recorded camera path (relative to where you stand), then gives the camera back
+local function playCam(e)
+	local cam = workspace.CurrentCamera
+	local pts = e.cam
+	if not cam or not pts or #pts < 2 then return end
+	local rootCF = fxRoot.CFrame
+	local oldType, oldFov = cam.CameraType, cam.FieldOfView
+	cam.CameraType = Enum.CameraType.Scriptable
+	pcall(function() workspace:SetAttribute("_ReplayCam", true) end)
+	local t0 = os.clock()
+	local last = pts[#pts][1]
+	local i = 1
+	while os.clock() - t0 < last do
+		local t = os.clock() - t0
+		while i < #pts - 1 and pts[i + 1][1] < t do i += 1 end
+		local a, b = pts[i], pts[i + 1]
+		local al = math.clamp((t - a[1]) / math.max(b[1] - a[1], 1e-4), 0, 1)
+		cam.CFrame = rootCF * a[2]:Lerp(b[2], al)
+		cam.FieldOfView = a[3] + (b[3] - a[3]) * al
+		RunService.RenderStepped:Wait()
+	end
+	cam.CameraType = oldType
+	cam.FieldOfView = oldFov
+	pcall(function() workspace:SetAttribute("_ReplayCam", nil) end)
+end
+
 local function playFX(e)
+	if e.kind == "obj" then return playObj(e) end
+	if e.kind == "cam" then return playCam(e) end
 	if e.kind == "sfx" then
 		local s = Instance.new("Sound")
 		s:SetAttribute("_Replay", true)
@@ -778,6 +1204,19 @@ function K.evStr(ev)
 	if ev.mount then L[#L + 1] = "\tmount = " .. K.mountStr(ev.mount) .. "," end
 	if ev.att0 then L[#L + 1] = "\tatt0 = " .. K.mountStr(ev.att0) .. "," end
 	if ev.att1 then L[#L + 1] = "\tatt1 = " .. K.mountStr(ev.att1) .. "," end
+	if ev.kind == "obj" and ev.spec then
+		L[#L + 1] = "\trel = " .. K.cfStr(ev.rel or CFrame.new()) .. ","
+		L[#L + 1] = "\tspec = " .. K.specStr(ev.spec) .. ","
+		if ev.path and #ev.path >= 2 then
+			local ps = {}
+			for _, pt in ipairs(ev.path) do ps[#ps + 1] = string.format("{%s, %s}", K.g(pt[1]), K.cfStr(pt[2])) end
+			L[#L + 1] = "\tpath = { " .. table.concat(ps, ", ") .. " },"
+		end
+	elseif ev.kind == "cam" and ev.cam then
+		local cs = {}
+		for _, pt in ipairs(ev.cam) do cs[#cs + 1] = string.format("{%s, %s, %s}", K.g(pt[1]), K.cfStr(pt[2]), K.g(pt[3])) end
+		L[#L + 1] = "\tcam = { " .. table.concat(cs, ", ") .. " },"
+	end
 	L[#L + 1] = "\tprops = {"
 	for _, kv in ipairs(ev.props) do
 		L[#L + 1] = string.format("\t\t{%q, %s},", kv[1], kv[2])
@@ -790,13 +1229,15 @@ end
 function K.genFXBlock(events)
 	local L = {}
 	local function add(s) L[#L + 1] = s end
-	add("-- VFX / SFX: rebuilt from properties (no assets needed). Each effect runs inside pcall,")
+	add("-- VFX / SFX / spawned objects / cutscene camera: rebuilt from properties. Each runs inside pcall,")
 	add("-- so if a sound or effect fails, the rest - and the animation - still play.")
 	add("task.spawn(function()")
 	add("\tlocal ok, err = pcall(function()")
 	add("\t\tlocal FX = {")
 	for _, ev in ipairs(events) do
-		add(K.indentLines(K.evStr(ev), "\t\t\t") .. ",")
+		if not (ev.kind == "cam" and #(ev.cam or {}) < 2) and not (ev.kind == "obj" and not ev.spec) then
+			add(K.indentLines(K.evStr(ev), "\t\t\t") .. ",")
+		end
 	end
 	add("\t\t}")
 	add(K.indentLines(FX_RUNTIME, "\t\t"))
@@ -1210,7 +1651,7 @@ function K.rawFromSequence(ks, char)
 	if #kfs == 0 then error("no keyframes") end
 	table.sort(kfs, function(a, b) return a.Time < b.Time end)
 	local length = kfs[#kfs].Time
-	if length <= 0 then error("animation has no duration") end
+	if length <= 0 then length = 0.1 end -- a single still pose (e.g. a Block pose): hold it for a moment
 
 	local curves = {}
 	for _, kf in ipairs(kfs) do
@@ -1300,23 +1741,30 @@ function K.rawFromPlaying(id, char, progress)
 	track.Looped = false
 
 	local waited = 0
-	while track.Length == 0 and waited < 5 do waited += RunService.Heartbeat:Wait() end
+	while track.Length == 0 and waited < 3 do waited += RunService.Heartbeat:Wait() end
 	local length = track.Length
-	if length == 0 then
-		dummy:Destroy()
-		error("animation failed to load (not allowed / invalid id)")
-	end
-
-	local speedMul = math.clamp(length / 2, 1, 4) -- long animations are captured faster
+	local still = length == 0 -- a single still pose (e.g. Block): hold it and sample it
+	if still then length = 0.2 end
+	-- long animations are captured faster, very short ones slower so there are enough frames
+	local speedMul = length < 0.8 and math.max(length / 0.8, 0.1) or math.clamp(length / 2, 1, 4)
+	local step = math.min(CAPTURE_STEP, length / 24)
 	progress(string.format("Capturing on a hidden rig (%.1fx speed)...", speedMul))
 
 	local samples = {}
 	for _, m in ipairs(motors) do samples[m] = {} end
 
+	if still then track.Looped = true end
 	track:Play(0, 1, speedMul)
 	local startClock, nextT, firstPos, lastReport = os.clock(), 0, nil, 0
 	local maxWall = length / speedMul + 3
-	while track.IsPlaying and os.clock() - startClock < maxWall do
+	if still then
+		for _ = 1, 4 do RunService.Heartbeat:Wait() end
+		for _, m in ipairs(motors) do
+			local cf = m.Transform
+			samples[m] = { { 0, cf }, { length, cf } }
+		end
+	end
+	while not still and track.IsPlaying and os.clock() - startClock < maxWall do
 		RunService.Heartbeat:Wait()
 		local pos = track.TimePosition
 		if pos > 0 and pos >= nextT then
@@ -1324,7 +1772,7 @@ function K.rawFromPlaying(id, char, progress)
 			for _, m in ipairs(motors) do
 				table.insert(samples[m], { pos - firstPos, m.Transform })
 			end
-			nextT = pos + CAPTURE_STEP * 0.9
+			nextT = pos + step * 0.9
 			if os.clock() - lastReport > 0.25 then
 				lastReport = os.clock()
 				progress(string.format("Capturing... %d%%", math.floor(pos / length * 100)))
@@ -1359,7 +1807,7 @@ function K.buildRecord(id, raw, rig)
 		end
 	end
 	if #joints == 0 then
-		error("no joints moved - rig mismatch? (your rig is " .. rig .. ")")
+		error("no joints moved - the animation may be unusable here or made for another rig (your rig is " .. rig .. ")")
 	end
 	animInfo[id] = animInfo[id] or { priority = raw.priorityName, looped = raw.looped, speed = 1 }
 	return {
@@ -1420,13 +1868,28 @@ function K.summaryFor(id)
 	)
 end
 
+-- mode: nil = frame by frame only | "vfx" = + VFX and SFX | "cut" = + cutscene camera | "all" = + spawned objects too
+function K.fxFilter(list, mode)
+	if not list or not mode then return nil end
+	local out = {}
+	for _, e in ipairs(list) do
+		local k = X.evSection(e)
+		if k == "vfx" or k == "sfx" or (k == "cam" and (mode == "cut" or mode == "all")) or (k == "obj" and mode == "all") then
+			out[#out + 1] = e
+		end
+	end
+	return out
+end
+
 function K.buildAnimCode(id, withFX)
+	local mode = withFX
+	if mode == true then mode = "vfx" end
 	local d = details[id]
 	if not d then error("not captured yet") end
 	local c = K.simplified(id)
 	local note = string.format("Frames: %d kept of %d sampled (quality: %s)", c.kept, c.total, QUALITY)
 		.. (X.keyNote and X.keyNote(id) or "")
-	return K.genDetailedCode(id, d.rig, d.length, d.looped, c.joints, withFX and fxWindows.liveFor(id) or nil, note)
+	return K.genDetailedCode(id, d.rig, d.length, d.looped, c.joints, mode and K.fxFilter(fxWindows.liveFor(id), mode) or nil, note)
 end
 
 --// Themes ---------------------------------------------------------------------------------
@@ -1977,24 +2440,30 @@ local function createWindow(opts)
 	mini.Font = Th.bold
 	mini.TextSize = 17
 	mini.Visible = false
+	local topMini = opts.topMini
+	if topMini then mini.AnchorPoint = Vector2.new(0.5, 0) end
 	local miniStroke = Instance.new("UIStroke")
 	miniStroke.Color = C.outline
 	miniStroke.Parent = mini
 
 	function win.setMinimized(v)
 		if v then
-			mini.Position = frame.Position
+			mini.Position = topMini and UDim2.new(0.5, 0, 0, 2) or frame.Position
 			frame.Visible = false
 			mini.Visible = true
 		else
-			frame.Position = mini.Position
+			if topMini then -- always reopens in the middle of the screen
+				frame.Position = UDim2.new(0.5, -frame.Size.X.Offset / 2, 0.5, -frame.Size.Y.Offset / 2)
+			else
+				frame.Position = mini.Position
+			end
 			mini.Visible = false
 			frame.Visible = true
 		end
 	end
 
 	function win.getState()
-		local pos = frame.Visible and frame.AbsolutePosition or mini.AbsolutePosition
+		local pos = (frame.Visible or topMini) and frame.AbsolutePosition or mini.AbsolutePosition
 		return {
 			x = pos.X, y = pos.Y,
 			w = frame.Size.X.Offset, h = frame.Size.Y.Offset,
@@ -2022,7 +2491,11 @@ local function createWindow(opts)
 	end)
 
 	makeDraggable(frame, titleBar, nil, conns)
-	makeDraggable(mini, mini, function() win.setMinimized(false) end, conns)
+	if topMini then
+		mini.MouseButton1Click:Connect(function() win.setMinimized(false) end) -- fixed square: tap to open, no dragging
+	else
+		makeDraggable(mini, mini, function() win.setMinimized(false) end, conns)
+	end
 
 	win.frame, win.content, win.mini = frame, content, mini
 	if opts.startMinimized then win.setMinimized(true) end
@@ -2244,13 +2717,13 @@ end
 
 -- variants = { { name = "Frames", get = function(cb, setStatus) cb(code) / cb(nil, err) end }, ... }
 local viewerCount = 0
-local function openViewer(titleText, variants, startIndex)
+local function openViewer(titleText, variants, startIndex, toolId)
 	viewerCount += 1
 	local off = (viewerCount % 6) * 22
 	local win = createWindow({
 		title = titleText,
-		size = Vector2.new(560, 440),
-		pos = UDim2.new(0.5, -280 + off, 0.5, -220 + off),
+		size = Vector2.new(600, 440),
+		pos = UDim2.new(0.5, -300 + off, 0.5, -220 + off),
 		minSize = Vector2.new(340, 220),
 		miniText = "{ }",
 	})
@@ -2262,9 +2735,14 @@ local function openViewer(titleText, variants, startIndex)
 	bar.BackgroundTransparency = 1
 	bar.Parent = content
 
-	local tabsRow = Instance.new("Frame")
-	tabsRow.Size = UDim2.new(1, -262, 1, 0)
+	local tabsRow = Instance.new("ScrollingFrame") -- scrolls sideways when the tabs do not fit
+	tabsRow.Size = UDim2.new(1, toolId and -348 or -262, 1, 0)
 	tabsRow.BackgroundTransparency = 1
+	tabsRow.BorderSizePixel = 0
+	tabsRow.ScrollBarThickness = 0
+	tabsRow.CanvasSize = UDim2.new()
+	tabsRow.AutomaticCanvasSize = Enum.AutomaticSize.X
+	tabsRow.ScrollingDirection = Enum.ScrollingDirection.X
 	tabsRow.Parent = bar
 	local tabLayout = Instance.new("UIListLayout")
 	tabLayout.FillDirection = Enum.FillDirection.Horizontal
@@ -2357,9 +2835,37 @@ local function openViewer(titleText, variants, startIndex)
 		end)
 	end
 
+	if toolId then -- GET tool: turns the code you are looking at into a Tool that plays the animation when clicked
+		local getBtn = K.newButton(bar, "GET tool", C.green)
+		getBtn.Size = UDim2.new(0, 80, 1, 0)
+		getBtn.Position = UDim2.new(1, -342, 0, 0)
+		getBtn.MouseButton1Click:Connect(function()
+			if not current then return K.flash(getBtn, "Wait...") end
+			local base = current
+			status.Text = "Looking for this animation's modules and models..."
+			task.spawn(function()
+				local okC, ctx = pcall(K.findAnimContext, toolId)
+				if not okC then ctx = { modules = {}, models = {}, scripts = {} } end
+				local okT, toolCode = pcall(K.buildToolCode, toolId, base, ctx, animLabel[toolId])
+				if not status.Parent then return end
+				if not okT then
+					status.Text = "GET tool failed: " .. tostring(toolCode)
+					return K.flash(getBtn, "Error")
+				end
+				token += 1
+				current = toolCode
+				view.hideRaw()
+				if not pcall(view.setCode, toolCode) then view.showRaw(toolCode) end
+				for _, tb in ipairs(tabButtonsV) do K.paint(tb, C.btn) end
+				local copied = Clip.set(toolCode)
+				status.Text = string.format("TOOL script ready%s - %d module(s), %d model(s). Press Run to get the tool now.", copied and " + copied" or "", #ctx.modules, #ctx.models)
+				K.flash(getBtn, "Done!")
+			end)
+		end)
+	end
 	for i, v in ipairs(variants) do
 		local b = K.newButton(tabsRow, v.name, C.btn)
-		b.Size = UDim2.new(0, 92, 1, 0)
+		b.Size = UDim2.new(0, v.w or 92, 1, 0)
 		b.MouseButton1Click:Connect(function() show(i) end)
 		tabButtonsV[i] = b
 	end
@@ -2422,6 +2928,7 @@ local mainWin = createWindow({
 	pos = winPos,
 	minSize = Vector2.new(360, 340),
 	miniText = "LOG",
+	topMini = true,
 	startMinimized = savedWin.minimized == true,
 	confirmClose = true,
 	onClose = function()
@@ -2657,8 +3164,48 @@ do
 	bp.PaddingLeft = UDim.new(0, 6)
 	bp.Parent = box
 	X.sBox = box
+	X.cat, X.az = "All", false
+	local chipBar = Instance.new("ScrollingFrame") -- sort / filter chips
+	chipBar.Position = UDim2.new(0, 0, 0, 34)
+	chipBar.Size = UDim2.new(1, 0, 0, 30)
+	chipBar.BackgroundTransparency = 1
+	chipBar.BorderSizePixel = 0
+	chipBar.ScrollBarThickness = 0
+	chipBar.CanvasSize = UDim2.new()
+	chipBar.AutomaticCanvasSize = Enum.AutomaticSize.X
+	chipBar.ScrollingDirection = Enum.ScrollingDirection.X
+	chipBar.Parent = page
+	local chipLayout = Instance.new("UIListLayout")
+	chipLayout.FillDirection = Enum.FillDirection.Horizontal
+	chipLayout.Padding = UDim.new(0, 4)
+	chipLayout.Parent = chipBar
+	X.catBtns = {}
+	local function paintCats()
+		for name, b in pairs(X.catBtns) do K.paint(b, name == X.cat and C.sel or C.btn) end
+		K.paint(X.azBtn, X.az and C.sel or C.btn)
+	end
+	for _, name in ipairs({ "All", "Movesets", "Attacks", "Hits", "Block", "Movement", "Emotes", "Other" }) do
+		local b = K.newButton(chipBar, name, C.btn)
+		b.Size = UDim2.new(0, #name * 9 + 22, 0, 26)
+		b.TextSize = 14
+		X.catBtns[name] = b
+		b.MouseButton1Click:Connect(function()
+			X.cat = name
+			paintCats()
+			if X.db then X.render() end
+		end)
+	end
+	X.azBtn = K.newButton(chipBar, "A-Z", C.btn)
+	X.azBtn.Size = UDim2.new(0, 48, 0, 26)
+	X.azBtn.TextSize = 14
+	X.azBtn.MouseButton1Click:Connect(function()
+		X.az = not X.az
+		paintCats()
+		if X.db then X.render() end
+	end)
+	paintCats()
 	local info = Instance.new("TextLabel")
-	info.Position = UDim2.new(0, 4, 0, 34)
+	info.Position = UDim2.new(0, 4, 0, 66)
 	info.Size = UDim2.new(1, -8, 0, 20)
 	info.BackgroundTransparency = 1
 	info.TextColor3 = C.sub
@@ -2669,7 +3216,7 @@ do
 	info.Text = "Press Scan game to list every animation in this game."
 	info.Parent = page
 	X.sInfo = info
-	lists.Search = newList(page, UDim2.new(0, 0, 0, 58), UDim2.new(1, 0, 1, -58))
+	lists.Search = newList(page, UDim2.new(0, 0, 0, 90), UDim2.new(1, 0, 1, -90))
 
 	X.sTok = 0
 	box:GetPropertyChangedSignal("Text"):Connect(function()
@@ -2963,8 +3510,10 @@ do
 		function() return X.deep end, function(v) X.deep = v end)
 	toggleRow("Thorough capture", "Also add dormant emitters on the character that have an EmitCount attribute (fired when the animation starts).",
 		function() return X.thorough end, function(v) X.thorough = v end)
-	toggleRow("Related FX guess", "Full+FX also adds effects / sounds found in the same tool or folder as the animation, or named like it (a guess).",
+	toggleRow("Related FX guess", "Full-FX-CUTSCENE also adds effects / sounds found in the same tool or folder as the animation, or named like it (a guess).",
 		function() return X.guess end, function(v) X.guess = v end)
+	toggleRow("Log spawned objects & cutscene camera", "Records swords, dummies and parts that appear while an animation plays, and cutscene camera moves. They show up in the FX Editor and in Full-FX-CUTSCENE / Full-Everything. Camera replay is skipped in the preview.",
+		function() return X.objOn end, function(v) X.objOn = v end)
 	do
 		local b, d = row("Look-back", "Seconds of effects remembered from BEFORE an animation is detected.", 100)
 		b.MouseButton1Click:Connect(function()
@@ -3497,6 +4046,13 @@ fxWindows.buf = {}
 fxWindows.related = {} -- [animId] = guessed events (Related FX guess / Search tab)
 
 fxWindows.pos = function(inst)
+	if inst:IsA("Model") then
+		local okM, cf = pcall(inst.GetPivot, inst)
+		if okM and cf then return cf.Position end
+	elseif inst:IsA("Tool") or inst:IsA("Accoutrement") then
+		local h = inst:FindFirstChild("Handle")
+		if h and h:IsA("BasePart") then return h.Position end
+	end
 	local part = inst:IsA("BasePart") and inst or inst:FindFirstAncestorWhichIsA("BasePart")
 	if part then return part.Position end
 	local m = inst:FindFirstAncestorOfClass("Model")
@@ -3548,10 +4104,11 @@ fxWindows.merge = function(...)
 		local list = select(i, ...)
 		for _, e in ipairs(list or {}) do
 			local k = evKey(e)
-			if not seen[k] and #out < 300 then
+			if not seen[k] and #out < 300 and (e.kind ~= "cam" or K.camKeep(e)) then
 				seen[k] = true
 				local c = table.clone(e)
-				if not c.dur then c.dur = c.kind == "sfx" and 3 or (c.enabled and 1.5 or 1) end
+				if not c.dur then c.dur = c.kind == "sfx" and 3 or (c.kind == "obj" and 2.5 or (c.enabled and 1.5 or 1)) end
+				if c.kind == "cam" and c.cam and #c.cam > 0 then c.dur = c.cam[#c.cam][1] end
 				out[#out + 1] = c
 			end
 		end
@@ -3583,11 +4140,37 @@ fxWindows.liveFor = function(id)
 	return fxWindows.rawFor(id)
 end
 
--- kind = "vfx" / "sfx"; extra = fields to force on the event (e.g. the real Emit count); at = time of the call
+-- an object's lifetime and (when it moves on its own) its path
+fxWindows.durObj = function(inst, ev, since)
+	local function ended()
+		if not ev.dur then ev.dur = math.max(os.clock() - since, 0.1) end
+	end
+	inst.Destroying:Connect(ended)
+	inst.AncestryChanged:Connect(function(_, parent)
+		if not parent then ended() end
+	end)
+	if (ev.mount and ev.mount.part) or not ev._root0 then return end -- worn: moves with the animation
+	local root0 = ev._root0
+	local path = { { 0, ev.rel } }
+	ev.path = path
+	task.spawn(function()
+		local t0 = os.clock()
+		while inst.Parent and not ev.dur and os.clock() - t0 < 10 and #path < 200 do
+			task.wait(0.05)
+			local pv = inst.Parent and K.objPivot(inst)
+			if pv then
+				local rel = root0:ToObjectSpace(pv)
+				if (rel.Position - path[#path][2].Position).Magnitude > 0.2 or (rel.LookVector - path[#path][2].LookVector).Magnitude > 0.1 then path[#path + 1] = { os.clock() - t0, rel } end
+			end
+		end
+	end)
+end
+
+-- kind = "vfx" / "sfx" / "obj"; extra = fields to force on the event (e.g. the real Emit count); at = time of the call
 local function recordFX(kind, inst, extra, at)
 	if kind == "sfx" and tostring(inst.SoundId):find("^rbxasset://sounds/") then return end -- default Roblox sounds
 	local now = at or os.clock()
-	local build = kind == "vfx" and K.buildVFXEvent or K.buildSFXEvent
+	local build = kind == "vfx" and K.buildVFXEvent or (kind == "obj" and K.buildObjEvent or K.buildSFXEvent)
 	local function applyExtra(ev)
 		if extra then
 			for k, v in pairs(extra) do ev[k] = v end
@@ -3603,6 +4186,7 @@ local function recordFX(kind, inst, extra, at)
 		if ok and ev then
 			applyExtra(ev)
 			fxWindows.dur(inst, ev, now)
+			if kind == "obj" then fxWindows.durObj(inst, ev, now) end
 			local buf = fxWindows.buf
 			buf[#buf + 1] = { kind = kind, ev = ev, at = now, pos = pos, inst = inst }
 			while #buf > 150 or (buf[1] and now - buf[1].at > X.pre + 3) do table.remove(buf, 1) end
@@ -3618,6 +4202,7 @@ local function recordFX(kind, inst, extra, at)
 				applyExtra(ev)
 				table.insert(w.events, ev)
 				fxWindows.dur(inst, ev, now)
+				if kind == "obj" then fxWindows.durObj(inst, ev, now) end
 			end
 		end
 	end
@@ -3625,6 +4210,7 @@ end
 
 local function finalizeFX(w)
 	if w.conn then pcall(function() w.conn:Disconnect() end) end
+	if w.camConn then pcall(function() w.camConn:Disconnect() end) end
 	if #w.keys > 0 then
 		local have = X.markers[w.id]
 		if not have or #w.keys > #have then X.markers[w.id] = w.keys end
@@ -3649,6 +4235,17 @@ local function openFXWindow(id, animator, track)
 		finish = now + math.max(len - into, 0) + FX_POST,
 	}
 	table.insert(fxWindows, w)
+	X.lastAnim = { id = id, start = w.start }
+	if X.objOn then -- cutscenes that started just before / during this animation belong to it
+		for _, sg in ipairs(X.camSegs) do
+			if sg.start >= w.start - X.pre - 1 and sg.start <= w.finish then
+				sg.attached = true
+				local cl = table.clone(sg.ev)
+				cl.t = math.max(sg.start - w.start, 0)
+				table.insert(w.events, cl)
+			end
+		end
+	end
 	pcall(function()
 		w.conn = track.KeyframeReached:Connect(function(name)
 			w.keys[#w.keys + 1] = { name, os.clock() - w.start }
@@ -3745,29 +4342,25 @@ end
 local function openAnimViewer(id)
 	local live = fxWindows.liveFor(id)
 	local hasFX = live and #live > 0
+	local function variant(name, mode, w)
+		return { name = name, w = w, get = function(cb, setStatus)
+			requestDetail(id, function(ok, res)
+				if ok then
+					local okC, code = pcall(K.buildAnimCode, id, mode)
+					if okC then cb(code) else cb(nil, code) end
+				else
+					cb(nil, res)
+				end
+			end, setStatus)
+		end }
+	end
 	openViewer("Anim - " .. (animLabel[id] or id), {
-		{ name = "Frames", get = function(cb, setStatus)
-			requestDetail(id, function(ok, res)
-				if ok then
-					local okC, code = pcall(K.buildAnimCode, id, false)
-					if okC then cb(code) else cb(nil, code) end
-				else
-					cb(nil, res)
-				end
-			end, setStatus)
-		end },
-		{ name = "Full+FX", get = function(cb, setStatus)
-			requestDetail(id, function(ok, res)
-				if ok then
-					local okC, code = pcall(K.buildAnimCode, id, true)
-					if okC then cb(code) else cb(nil, code) end
-				else
-					cb(nil, res)
-				end
-			end, setStatus)
-		end },
-		{ name = "Simple", get = function(cb) cb(K.simpleCode(id)) end },
-	}, hasFX and 2 or 1)
+		variant("Frame by frame", nil, 112), -- only the animation, nothing else
+		variant("Full - VFX", "vfx", 88), -- + VFX and SFX
+		variant("Full-VFX-Cutscenes", "cut", 150), -- + cutscene camera
+		variant("Full-Everything", "all", 122), -- + spawned parts / objects
+		{ name = "Simple", w = 66, get = function(cb) cb(K.simpleCode(id)) end },
+	}, hasFX and 2 or 1, id)
 end
 
 local function logAnim(animator, track)
@@ -3838,7 +4431,7 @@ local function logAnim(animator, track)
 	local actions = {
 		-- line 1: the important buttons
 		frameButton("Copy", false, 1),
-		frameButton("Full+FX", true, 1.3),
+		frameButton("Full-FX-CUTSCENE", "cut", 2.2),
 		runAct(function() K.playAnim(id) end, 1, 0.9),
 		act("VIEW FULL CODE", function() openAnimViewer(id) end, C.sel, 1, 2.2),
 		-- line 2: more
@@ -4042,6 +4635,96 @@ local function watchVFX(inst)
 		inst:GetPropertyChangedSignal("Enabled"):Connect(function()
 			if inst.Enabled then logVFX(inst) end
 		end)
+	end
+end
+
+-- spawned objects: swords, dummies, parts... that appear near you while an animation plays
+function X.objOk(d)
+	if d:GetAttribute("_LoggerClone") or d:GetAttribute("_Replay") then return false end
+	if d:IsA("Terrain") or d:IsA("Camera") then return false end
+	local p = d.Parent
+	while p and p ~= workspace do
+		if X.objSeen[p] or p:GetAttribute("_Replay") or p:GetAttribute("_LoggerClone") then return false end
+		p = p.Parent
+	end
+	if not p then return false end
+	if not (d:IsA("Tool") or d:IsA("Accoutrement")) then -- players' own bodies are not "spawned"
+		if d:IsA("Model") and Players:GetPlayerFromCharacter(d) then return false end
+		local m = d:FindFirstAncestorOfClass("Model")
+		while m do
+			if Players:GetPlayerFromCharacter(m) then return false end
+			m = m.Parent and m.Parent:FindFirstAncestorOfClass("Model")
+		end
+	end
+	if d:IsA("BasePart") then
+		if d.Transparency >= 1 or d.Size.Magnitude > 300 then return false end -- invisible hitboxes / the map
+	elseif d:IsA("Model") then
+		if not d:FindFirstChildWhichIsA("BasePart", true) then return false end
+	end
+	return true
+end
+
+function X.watchObj(d)
+	if not Run.alive or not X.objOn or not d.Parent then return end
+	if not X.objOk(d) then return end
+	local now = os.clock()
+	if now - (X.objT or 0) > 1 then X.objT, X.objN = now, 0 end
+	X.objN += 1
+	if X.objN > 60 then return end
+	X.objSeen[d] = true
+	recordFX("obj", d)
+end
+
+-- cutscene camera: watched all the time, so cutscenes are caught even when nothing plays on your own character
+function X.camActive(c)
+	if workspace:GetAttribute("_ReplayCam") then return false end -- our own replay
+	if c.CameraType == Enum.CameraType.Scriptable then return true end
+	local subj, ch = c.CameraSubject, lp.Character
+	return subj ~= nil and ch ~= nil and not subj:IsDescendantOf(ch) -- camera is looking at something that is not you
+end
+
+function X.camEnd(seg)
+	X.camSeg = nil
+	if seg.attached or not K.camKeep(seg.ev) then return end
+	local la = X.lastAnim
+	if la and seg.start >= la.start - 1 and seg.start - la.start < 10 then -- no window was open: use the animation that just played
+		local cl = table.clone(seg.ev)
+		cl.t = math.max(seg.start - la.start, 0)
+		animFX[la.id] = fxWindows.merge(animFX[la.id], { cl })
+		pcall(refreshExtra, la.id)
+	end
+end
+
+function X.camStep()
+	local c = workspace.CurrentCamera
+	local ch = lp.Character
+	local root = ch and ch:FindFirstChild("HumanoidRootPart")
+	if not c or not root then return end
+	local now = os.clock()
+	local seg = X.camSeg
+	if X.camActive(c) then
+		if not seg then
+			seg = { start = now, rootCF = root.CFrame, ev = { kind = "cam", name = "Cutscene camera", t = 0, props = {}, cam = {}, dur = 0 } }
+			X.camSeg = seg
+			table.insert(X.camSegs, seg)
+			while #X.camSegs > 12 do table.remove(X.camSegs, 1) end
+			for _, w in ipairs(fxWindows) do
+				if now <= w.finish then
+					seg.attached = true
+					local cl = table.clone(seg.ev)
+					cl.t = math.max(now - w.start, 0)
+					table.insert(w.events, cl)
+				end
+			end
+		end
+		local dt = now - seg.start
+		local pts = seg.ev.cam
+		local last = pts[#pts]
+		if dt < 60 and #pts < 1200 and (not last or dt - last[1] >= 0.04) then
+			pts[#pts + 1] = { dt, seg.rootCF:ToObjectSpace(c.CFrame), c.FieldOfView }
+		end
+	elseif seg then
+		X.camEnd(seg)
 	end
 end
 
@@ -4334,7 +5017,7 @@ function X.searchActions(e)
 	end
 	return {
 		frameBtn("Copy", false, 1),
-		frameBtn("Full+FX", true, 1.3),
+		frameBtn("Full-FX-CUTSCENE", "cut", 2.2),
 		act("Preview", function() X.pvOpen(id, e) end, C.green, 1, 1),
 		act("VIEW FULL CODE", function()
 			X.prepareFX(e)
@@ -4369,7 +5052,7 @@ function X.more()
 	local to = math.min(X.shown + X.PAGE, #X.matches)
 	for i = X.shown + 1, to do X.addRow(X.matches[i]) end
 	X.shown = to
-	X.sInfo.Text = string.format("%d of %d animations match - showing %d", #X.matches, #X.db, X.shown)
+	X.sInfo.Text = string.format("%d of %d animations match%s - showing %d", #X.matches, #X.db, X.cat ~= "All" and (" (" .. X.cat .. ")") or "", X.shown)
 	if X.shown < #X.matches then
 		local b = K.newButton(list, string.format("Show more (%d left)", #X.matches - X.shown), C.btn)
 		b.Name = "MoreBtn"
@@ -4395,8 +5078,13 @@ function X.render()
 				break
 			end
 		end
+		if ok and X.cat ~= "All" then
+			e.cat = e.cat or K.animCat(e)
+			ok = e.cat == X.cat
+		end
 		if ok then matches[#matches + 1] = e end
 	end
+	if X.az then table.sort(matches, function(a, b) return tostring(a.name):lower() < tostring(b.name):lower() end) end
 	X.matches, X.shown = matches, 0
 	clearKind("Search")
 	X.more()
@@ -4500,7 +5188,11 @@ end
 -- run FX events on any model (the preview rig) instead of your own character
 function X.runOn(events, title, rig)
 	if not loadstring then error("loadstring is not available in this executor") end
-	local code = K.genStandaloneFX(events, title)
+	local nocam = {}
+	for _, e in ipairs(events) do
+		if e.kind ~= "cam" then nocam[#nocam + 1] = e end -- the preview must not take over your camera
+	end
+	local code = K.genStandaloneFX(nocam, title)
 	code = code:gsub("local lp = Players%.LocalPlayer", "local lp = { Character = (getgenv and getgenv() or _G).__AVL_PreviewRig }", 1)
 	local fn, err = loadstring(code)
 	if not fn then error(err) end
@@ -4710,7 +5402,29 @@ function X.copyAnim(id, withFX, btn, text)
 	end, function(t) if btn.Parent then btn.Text = t:sub(1, 16) end end)
 end
 
+function X.evSection(e)
+	if e.kind == "sfx" then return "sfx" end
+	if e.kind == "obj" then return "obj" end
+	if e.kind == "cam" then return "cam" end
+	return "vfx"
+end
+
+function X.kc(k)
+	if k == "vfx" then return C.vfx end
+	if k == "sfx" then return C.sfx end
+	if k == "obj" then return Color3.fromRGB(235, 165, 70) end
+	return Color3.fromRGB(190, 125, 235)
+end
+
 function X.evLines(e)
+	if e.kind == "obj" then
+		local n = e.spec and #e.spec.parts or 0
+		local how = (e.mount and e.mount.part) and ("attached to " .. e.mount.part) or ((e.path and #e.path >= 2) and "moves" or "placed")
+		return (e.dummy and "DUMMY  " or "OBJECT  ") .. tostring(e.name) .. "  (" .. tostring(e.class) .. ")",
+			string.format("%d part%s  |  %s  |  %.1fs", n, n == 1 and "" or "s", how, e.dur or 2.5)
+	elseif e.kind == "cam" then
+		return "CAMERA  " .. tostring(e.name), string.format("cutscene camera  |  %d points  |  %.1fs", e.cam and #e.cam or 0, e.dur or 0)
+	end
 	if e.kind == "sfx" then
 		local sid = ""
 		for _, p in ipairs(e.props or {}) do
@@ -4878,7 +5592,7 @@ function X.edVisible()
 	local q = (E.query or ""):lower()
 	for _, e in ipairs(E.events) do
 		local isSfx = e.kind == "sfx"
-		if E.filter == "all" or (E.filter == "sfx") == isSfx then
+		if E.filter == "all" or X.evSection(e) == E.filter then
 			if q == "" then
 				vis[#vis + 1] = e
 			else
@@ -4948,12 +5662,23 @@ function X.edDraw() -- timeline
 	local T = math.max(len, last, 1) + 0.5
 	local pps = E.pps
 	local W = T * pps + 20
+	local LH = X.LANEH
 
-	-- give every event a lane; an event only shares a lane when it does not overlap the one before it
-	local lanes, place = { vfx = {}, sfx = {} }, {}
-	local count = { vfx = 0, sfx = 0 }
+	-- sections: effects and sounds always, spawned objects and the cutscene camera when something was logged.
+	-- Inside a section every event gets its own lane when events overlap, so nothing is hidden behind another block.
+	local SEC = {
+		{ "vfx", "VISUAL EFFECTS", true },
+		{ "sfx", "SOUNDS", true },
+		{ "obj", "SPAWNED OBJECTS (swords, dummies, parts...)", false },
+		{ "cam", "CUTSCENE CAMERA", false },
+	}
+	local lanes, place, count = {}, {}, {}
+	for _, sc in ipairs(SEC) do
+		lanes[sc[1]] = {}
+		count[sc[1]] = 0
+	end
 	for _, e in ipairs(E.events) do
-		local k = e.kind == "sfx" and "sfx" or "vfx"
+		local k = X.evSection(e)
 		count[k] += 1
 		local x = e.t * pps
 		local w = (e.emit and not e.enabled) and 14 or (e.dur or (k == "sfx" and 1 or 0.5)) * pps
@@ -4970,16 +5695,22 @@ function X.edDraw() -- timeline
 		ln[lane] = x + w
 		place[e] = { x = x, w = w, lane = lane }
 	end
-	local nv, ns = math.max(#lanes.vfx, 1), math.max(#lanes.sfx, 1)
-	local LH = X.LANEH
-	local vTop = 28
-	local sTop = vTop + nv * LH + 22
-	local H = sTop + ns * LH + 8
+	local top, order, y = {}, {}, 12
+	for _, sc in ipairs(SEC) do
+		local k = sc[1]
+		if sc[3] or count[k] > 0 then
+			local n = math.max(#lanes[k], 1)
+			top[k] = y + 16
+			order[#order + 1] = { k, sc[2], n }
+			y = top[k] + n * LH + 8
+		end
+	end
+	local H = y + 4
 	E.tl.CanvasSize = UDim2.fromOffset(W, H)
 
-	local function box(x, y, w, h, color, tr)
+	local function box(x, yy, w, h, color, tr)
 		local f = Instance.new("Frame")
-		f.Position = UDim2.fromOffset(x, y)
+		f.Position = UDim2.fromOffset(x, yy)
 		f.Size = UDim2.fromOffset(w, h)
 		f.BackgroundColor3 = color
 		f.BackgroundTransparency = tr or 0
@@ -4988,9 +5719,9 @@ function X.edDraw() -- timeline
 		f.Parent = E.tl
 		return f
 	end
-	local function text(x, y, w, str, color, size)
+	local function text(x, yy, w, str, color, size)
 		local l = Instance.new("TextLabel")
-		l.Position = UDim2.fromOffset(x, y)
+		l.Position = UDim2.fromOffset(x, yy)
 		l.Size = UDim2.fromOffset(w, 14)
 		l.BackgroundTransparency = 1
 		l.Text = str
@@ -5002,12 +5733,13 @@ function X.edDraw() -- timeline
 		return l
 	end
 
-	box(0, vTop - 2, W, nv * LH + 4, C.row1)
-	box(0, sTop - 2, W, ns * LH + 4, C.row2)
-	for i = 1, nv - 1 do box(0, vTop + i * LH - 1, W, 1, C.outline, 0.6) end
-	for i = 1, ns - 1 do box(0, sTop + i * LH - 1, W, 1, C.outline, 0.6) end
-	text(4, vTop - 15, 400, string.format("VISUAL EFFECTS (%d)%s", count.vfx, nv > 1 and ("  -  " .. nv .. " rows, overlapping effects get their own row") or ""), C.vfx, 11)
-	text(4, sTop - 15, 400, string.format("SOUNDS (%d)", count.sfx), C.sfx, 11)
+	for i, o in ipairs(order) do
+		local k, label, n = o[1], o[2], o[3]
+		box(0, top[k] - 2, W, n * LH + 4, (i % 2 == 1) and C.row1 or C.row2)
+		for l = 1, n - 1 do box(0, top[k] + l * LH - 1, W, 1, C.outline, 0.6) end
+		local extra = (n > 1) and ("  -  " .. n .. " rows (overlapping events)") or ""
+		text(4, top[k] - 15, 520, string.format("%s (%d)%s", label, count[k], extra), X.kc(k), 11)
+	end
 
 	local step = pps >= 240 and 0.25 or (pps >= 100 and 0.5 or 1)
 	for i = 0, math.floor(T / step) do
@@ -5022,28 +5754,22 @@ function X.edDraw() -- timeline
 	end
 
 	for _, e in ipairs(E.events) do
-		local isSfx = e.kind == "sfx"
+		local k = X.evSection(e)
 		local p = place[e]
 		local m = Instance.new("TextButton")
 		m.AutoButtonColor = false
-		m.Position = UDim2.fromOffset(p.x, (isSfx and sTop or vTop) + (p.lane - 1) * LH + 1)
+		m.Position = UDim2.fromOffset(p.x, top[k] + (p.lane - 1) * LH + 1)
 		m.Size = UDim2.fromOffset(p.w, LH - 3)
-		m.BackgroundColor3 = isSfx and C.sfx or C.vfx
+		m.BackgroundColor3 = X.kc(k)
 		m.BackgroundTransparency = e.off and 0.75 or 0
 		m.BorderSizePixel = 0
-		m.Text = p.w >= 40 and tostring(e.name) or ""
+		m.Text = p.w >= 40 and ((e == E.sel and "> " or "") .. tostring(e.name)) or ""
 		m.TextColor3 = Color3.fromRGB(15, 15, 15)
 		m.Font = Th.font
 		m.TextSize = 12
 		m.TextTruncate = Enum.TextTruncate.AtEnd
 		m.ZIndex = (e == E.sel) and 5 or 3
 		m:SetAttribute("NoCorner", true)
-		if e == E.sel then
-			local st = Instance.new("UIStroke")
-			st.Color = Color3.fromRGB(255, 255, 254)
-			st.Thickness = 2
-			st.Parent = m
-		end
 		-- tap = select, drag = move in time
 		m.InputBegan:Connect(function(input)
 			if not K.isPress(input) then return end
@@ -5097,7 +5823,7 @@ function X.edPanel() -- details + controls of the selected event
 	end
 	local title, detail = X.evLines(e)
 	local isSfx = e.kind == "sfx"
-	lbl.Text = string.format('<font color="%s"><b>%s</b></font>   %s', K.hex(isSfx and C.sfx or C.vfx), K.esc(title), K.esc(detail))
+	lbl.Text = string.format('<font color="%s"><b>%s</b></font>   %s', K.hex(X.kc(X.evSection(e))), K.esc(title), K.esc(detail))
 
 	local bar = X.mkBar(E.panel, 28, 34)
 	local function ch(fn) return function() X.edChange(fn) end end
@@ -5112,7 +5838,7 @@ function X.edPanel() -- details + controls of the selected event
 	end)
 	X.mkTool(bar, "+", 28, C.btn, ch(function() e.t = e.t + 0.05 end))
 
-	if not (e.emit and not e.enabled) then
+	if e.kind ~= "cam" and not (e.emit and not e.enabled) then
 		X.mkLabel(bar, "Length", 44)
 		X.mkTool(bar, "-", 28, C.btn, ch(function() e.dur = math.max((e.dur or 1) - 0.1, 0.1) end))
 		local db = X.mkBox(bar, 62, string.format("%.2f", e.dur or 1))
@@ -5144,10 +5870,11 @@ function X.edList() -- readable event list
 		if c:IsA("GuiObject") then c:Destroy() end
 	end
 
-	local off, nV, nS = 0, 0, 0
+	local off, cnt = 0, { vfx = 0, sfx = 0, obj = 0, cam = 0 }
 	for _, e in ipairs(E.events) do
 		if e.off then off += 1 end
-		if e.kind == "sfx" then nS += 1 else nV += 1 end
+		local k = X.evSection(e)
+		cnt[k] += 1
 	end
 
 	local vis = X.edVisible()
@@ -5163,7 +5890,7 @@ function X.edList() -- readable event list
 
 		local stripe = Instance.new("Frame")
 		stripe.Size = UDim2.new(0, 4, 1, 0)
-		stripe.BackgroundColor3 = isSfx and C.sfx or C.vfx
+		stripe.BackgroundColor3 = X.kc(X.evSection(e))
 		stripe.BorderSizePixel = 0
 		stripe:SetAttribute("NoCorner", true)
 		stripe.Parent = row
@@ -5201,11 +5928,11 @@ function X.edList() -- readable event list
 	E.list.CanvasPosition = keep
 
 	if #E.events == 0 then
-		E.info.Text = "No FX recorded for this animation yet. Play it in-game, press Capture, or use the Search tab."
+		E.info.Text = "Nothing recorded for this animation yet. Play it in-game, press Capture, or use the Search tab."
 	else
 		E.info.Text = string.format(
-			'%d events (%d off)  |  <font color="%s">%d VFX</font>  <font color="%s">%d SFX</font>  |  %s%s',
-			#E.events, off, K.hex(C.vfx), nV, K.hex(C.sfx), nS,
+			'%d events (%d off)  |  <font color="%s">%d VFX</font>  <font color="%s">%d SFX</font>  <font color="%s">%d OBJ</font>  <font color="%s">%d CAM</font>  |  %s%s',
+			#E.events, off, K.hex(C.vfx), cnt.vfx, K.hex(C.sfx), cnt.sfx, K.hex(X.kc("obj")), cnt.obj, K.hex(X.kc("cam")), cnt.cam,
 			E.dirty and "edited - Copy / Preview / Run use your edits" or "live recording",
 			#vis > 300 and "  |  showing first 300" or ""
 		)
@@ -5231,7 +5958,7 @@ function X.edOpen(id)
 	local content = win.content
 
 	local bar = X.mkBar(content, 6, 34)
-	X.mkTool(bar, "Copy Full+FX", 108, C.sel, function(b) X.copyAnim(id, true, b, "Copy Full+FX") end)
+	X.mkTool(bar, "Copy Everything", 120, C.sel, function(b) X.copyAnim(id, "all", b, "Copy Everything") end)
 	X.mkTool(bar, "Preview", 68, C.green, function() X.pvOpen(id) end)
 	X.mkTool(bar, "Anim Editor", 94, C.sel, function() X.aeOpen(id) end)
 	X.mkTool(bar, "Undo", 54, C.btn, function() X.edUndo() end)
@@ -5294,10 +6021,10 @@ function X.edOpen(id)
 	local function paintChips()
 		for name, b in pairs(chips) do K.paint(b, E.filter == name and C.sel or C.btn) end
 	end
-	for i, def in ipairs({ { "all", "All" }, { "vfx", "VFX" }, { "sfx", "SFX" } }) do
+	for i, def in ipairs({ { "all", "All" }, { "vfx", "VFX" }, { "sfx", "SFX" }, { "obj", "OBJ" }, { "cam", "CAM" } }) do
 		local b = K.newButton(fbar, def[2], C.btn)
-		b.Position = UDim2.new(0, (i - 1) * 50, 0, 0)
-		b.Size = UDim2.new(0, 46, 0, 28)
+		b.Position = UDim2.new(0, (i - 1) * 48, 0, 0)
+		b.Size = UDim2.new(0, 44, 0, 28)
 		b.TextSize = 14
 		chips[def[1]] = b
 		b.MouseButton1Click:Connect(function()
@@ -5308,8 +6035,8 @@ function X.edOpen(id)
 	end
 	paintChips()
 	local search = X.mkBox(fbar, 100, "", "Search effects...")
-	search.Position = UDim2.new(0, 154, 0, 0)
-	search.Size = UDim2.new(1, -154, 0, 28)
+	search.Position = UDim2.new(0, 246, 0, 0)
+	search.Size = UDim2.new(1, -246, 0, 28)
 	search:GetPropertyChangedSignal("Text"):Connect(function()
 		E.query = search.Text
 		X.edList()
@@ -5995,7 +6722,7 @@ end
 
 function X.aeRun(A)
 	if not loadstring then error("loadstring is not available in this executor") end
-	local fn, err = loadstring(K.buildAnimCode(A.id, A.fxPrev))
+	local fn, err = loadstring(K.buildAnimCode(A.id, A.fxPrev and "all" or nil))
 	if not fn then error(err) end
 	task.spawn(fn)
 end
@@ -6035,9 +6762,8 @@ function X.aeDrawBar(A)
 		return f
 	end
 	-- the part you selected
-	frame(A.a / len, (A.b - A.a) / len, 0, 0, 56, C.sel, 0.45, 2)
-	frame(A.a / len, 0, 0, 2, 56, Color3.fromRGB(255, 255, 255), 0.1, 3)
-	frame(A.b / len, 0, 0, 2, 56, Color3.fromRGB(255, 255, 255), 0.1, 3)
+	frame(A.a / len, 0, 0, 1, 56, C.sub, 0.3, 3)
+	frame(A.b / len, 0, 0, 1, 56, C.sub, 0.3, 3)
 	-- one tick per stored frame
 	local first = A.tr[A.slotJ[1] or 1]
 	local n = #first
@@ -6080,12 +6806,7 @@ function X.aeDrawBar(A)
 			b.Text = string.format("%d  (%.1fs)%s%s", i, ends[i] - starts[i], c.rev and " rev" or "", math.abs(c.speed - 1) > 1e-6 and (" x" .. tostring(c.speed)) or "")
 		end
 		b:SetAttribute("NoCorner", true)
-		if i == A.selClip then
-			local st = Instance.new("UIStroke")
-			st.Color = Color3.fromRGB(255, 255, 255)
-			st.Thickness = 2
-			st.Parent = b
-		end
+		if i == A.selClip then b.Text = "> " .. b.Text end -- selected clip is marked with an arrow, not a highlight
 		b.InputBegan:Connect(function(input)
 			if K.isPress(input) then X.aeClipDrag(A, i, b, input) end
 		end)
@@ -6096,8 +6817,8 @@ function X.aeDrawBar(A)
 				h.AutoButtonColor = false
 				h.Text = ""
 				h.Active = true
-				h.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-				h.BackgroundTransparency = 0.25
+				h.BackgroundColor3 = C.sub
+				h.BackgroundTransparency = 0.2
 				h.BorderSizePixel = 0
 				h.ZIndex = 6
 				h.Size = UDim2.new(0, 12, 0, 36)
@@ -6124,7 +6845,7 @@ function X.aeRefresh(A)
 	local frames = #A.tr[A.slotJ[1] or 1]
 	A.info.Text = string.format(
 		"%.2fs  |  %d frames  |  clip %d of %d  |  loop %s  |  %s",
-		A.len, frames, A.selClip, #A.clips, A.looped and "on" or "off", A.status ~= "" and A.status or (#A.undo > 0 and "edited" or "original")
+		A.len, frames, A.selClip, #A.clips, A.looped and "on" or "off", A.status ~= "" and A.status or "tap the timeline to place the playhead, then Split"
 	)
 	if not A.aBox:IsFocused() then A.aBox.Text = string.format("%.2f", A.a) end
 	if not A.bBox:IsFocused() then A.bBox.Text = string.format("%.2f", A.b) end
@@ -6184,8 +6905,8 @@ function X.aeOpen(id)
 		X.aeRun(A)
 		K.flash(b, "Ran!")
 	end)
-	X.mkTool(tb, "Copy Full", 76, C.sel, function(b) X.copyAnim(id, false, b, "Copy Full") end)
-	X.mkTool(tb, "Copy +FX", 76, C.sel, function(b) X.copyAnim(id, true, b, "Copy +FX") end)
+	X.mkTool(tb, "Copy Frames", 88, C.sel, function(b) X.copyAnim(id, false, b, "Copy Frames") end)
+	X.mkTool(tb, "Copy Everything", 110, C.sel, function(b) X.copyAnim(id, "all", b, "Copy Everything") end)
 	X.mkTool(tb, "FX Editor", 76, C.btn, function() X.edOpen(id) end)
 
 	-- timeline: tap or drag to move the red playhead; the blue part is your selection
@@ -6276,10 +6997,25 @@ function X.aeOpen(id)
 		X.aeMoveHead(A)
 	end)
 
+	-- tool tabs: one group at a time keeps the editor tidy
+	A.tabs = {}
+	local tabBtns = {}
+	local function showTab(name)
+		A.tab = name
+		for tn, items in pairs(A.tabs) do
+			for _, o in ipairs(items) do o.Visible = (tn == name) end
+		end
+		for tn, b in pairs(tabBtns) do K.paint(b, tn == name and C.sel or C.btn) end
+	end
+	local tabBar = X.mkBar(content, 210, 34)
+	for _, tn in ipairs({ "Clips", "Cut", "Speed", "Direction", "Effects" }) do
+		tabBtns[tn] = X.mkTool(tabBar, tn, 76, C.btn, function() showTab(tn) end)
+	end
+
 	-- tools (scrollable)
 	local tools = Instance.new("ScrollingFrame")
-	tools.Position = UDim2.new(0, 6, 0, 210)
-	tools.Size = UDim2.new(1, -12, 1, -216)
+	tools.Position = UDim2.new(0, 6, 0, 248)
+	tools.Size = UDim2.new(1, -12, 1, -254)
 	tools.BackgroundColor3 = C.code
 	tools.BorderSizePixel = 0
 	tools.ScrollBarThickness = 8
@@ -6295,7 +7031,7 @@ function X.aeOpen(id)
 	pad.Parent = tools
 
 	local ord = 0
-	local function section(title, hint)
+	local function section(tab, title, hint)
 		ord += 1
 		local h = Instance.new("TextLabel")
 		h.Size = UDim2.new(1, 0, 0, hint and 34 or 20)
@@ -6309,6 +7045,8 @@ function X.aeOpen(id)
 		h.TextWrapped = true
 		h.LayoutOrder = ord
 		h.Parent = tools
+		A.tabs[tab] = A.tabs[tab] or {}
+		table.insert(A.tabs[tab], h)
 		ord += 1
 		local g = Instance.new("Frame")
 		g.Size = UDim2.new(1, 0, 0, 0)
@@ -6316,6 +7054,7 @@ function X.aeOpen(id)
 		g.BackgroundTransparency = 1
 		g.LayoutOrder = ord
 		g.Parent = tools
+		table.insert(A.tabs[tab], g)
 		local gl = Instance.new("UIGridLayout")
 		gl.CellSize = UDim2.new(0.5, -3, 0, 34)
 		gl.CellPadding = UDim2.new(0, 6, 0, 6)
@@ -6334,7 +7073,7 @@ function X.aeOpen(id)
 		return b
 	end
 
-	local g = section("Clips (like CapCut)", "1) Tap the timeline to put the red playhead where you want to cut. 2) Press Split. 3) Tap a clip to select it, drag it to re-order, drag its white edges to trim. Delete / reverse / speed apply to the selected clip.")
+	local g = section("Clips", "Clips (like CapCut)", "1) Tap the timeline to put the red playhead where you want to cut. 2) Press Split. 3) Tap a clip to select it, drag it to re-order, drag its white edges to trim. Delete / reverse / speed apply to the selected clip.")
 	tool(g, "Split at playhead", C.sel, function() X.aeSplit(A) end)
 	tool(g, "Delete clip", C.danger, function() X.aeDelClip(A) end)
 	tool(g, "Duplicate clip", C.btn, function() X.aeDupClip(A) end)
@@ -6348,7 +7087,7 @@ function X.aeOpen(id)
 	tool(g, "Clip speed 1x (normal)", C.btn, function() X.aeClipSpeed(A, 1) end)
 	tool(g, "Join all into one clip", C.btn, function() X.aeJoinAll(A) end)
 
-	g = section("Quick cut (blue selection)", "Set Start / End above (or tap the timeline and press Set [ / Set ]).")
+	g = section("Cut", "Quick cut", "Set Start / End with the boxes above (or tap the timeline and press Set [ / Set ]). Thin lines on the timeline mark them.")
 	tool(g, "Keep selection only", C.sel, function() X.aeTrim(A, A.a, A.b) end)
 	tool(g, "Delete selection", C.danger, function() X.aeCutOut(A, A.a, A.b) end)
 	tool(g, "Cut everything before playhead", C.btn, function() X.aeTrim(A, A.head, A.len) end)
@@ -6359,7 +7098,7 @@ function X.aeOpen(id)
 		X.aeRefresh(A)
 	end)
 
-	g = section("Speed", "Applies to the selected part (whole animation when everything is selected).")
+	g = section("Speed", "Speed", "Applies to the selected part (whole animation when everything is selected).")
 	tool(g, "0.5x (slower)", C.btn, function() X.aeSetSpeed(A, 0.5) end)
 	tool(g, "2x (faster)", C.btn, function() X.aeSetSpeed(A, 2) end)
 	tool(g, "0.25x (much slower)", C.btn, function() X.aeSetSpeed(A, 0.25) end)
@@ -6373,14 +7112,14 @@ function X.aeOpen(id)
 		X.aeSetSpeed(A, (A.b - A.a) / v)
 	end)
 
-	g = section("Direction & repeat")
+	g = section("Direction", "Direction & repeat")
 	tool(g, "Reverse selection", C.sel, function() X.aeReverse(A, A.a, A.b) end)
 	tool(g, "Reverse everything", C.btn, function() X.aeReverse(A, 0, A.len) end)
 	tool(g, "Ping-pong (forward then back)", C.btn, function() X.aePingPong(A) end)
 	tool(g, "Repeat x2", C.btn, function() X.aeRepeat(A, 2) end)
 	tool(g, "Repeat x3", C.btn, function() X.aeRepeat(A, 3) end)
 
-	g = section("Effects")
+	g = section("Effects", "Effects")
 	A.ui.fx = tool(g, "FX follow edits: On", C.sel, function()
 		A.fxOn = not A.fxOn
 		X.aeRefresh(A)
@@ -6390,6 +7129,7 @@ function X.aeOpen(id)
 		X.aeRefresh(A)
 	end)
 
+	showTab("Clips")
 	X.aeRefresh(A)
 end
 
@@ -6405,7 +7145,7 @@ saveSettings = function()
 	local ok, json = pcall(function()
 		return HttpService:JSONEncode({
 			version = 2, theme = Th.cur.name, filter = X.filter, compact = X.compact, deepHook = X.deep,
-			thorough = X.thorough, guessFX = X.guess, fxPre = X.pre,
+			thorough = X.thorough, guessFX = X.guess, objOn = X.objOn, fxPre = X.pre,
 			quality = QUALITY, ownOnly = ownOnly, uniqueOnly = uniqueOnly, detailedMode = detailedMode,
 			tab = lastLogTab,
 			excluded = labelsFor(excluded, animLabel),
@@ -6460,7 +7200,12 @@ table.insert(Run.conns, workspace.DescendantAdded:Connect(function(d)
 		hookSound(d, true)
 	elseif VFX_CLASSES[d.ClassName] then
 		task.defer(watchVFX, d)
+	elseif X.objOn and (d:IsA("Model") or d:IsA("Tool") or d:IsA("Accoutrement") or d:IsA("BasePart")) then
+		task.defer(X.watchObj, d)
 	end
+end))
+table.insert(Run.conns, RunService.Heartbeat:Connect(function()
+	if Run.alive and X.objOn then pcall(X.camStep) end
 end))
 table.insert(Run.conns, SoundService.DescendantAdded:Connect(function(d)
 	if Run.alive and d:IsA("Sound") then hookSound(d, true) end
